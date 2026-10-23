@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 
 #include "kernel/disc.h"
@@ -78,6 +79,10 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+    // what an overwrite on open released: FATX hands the freed clusters back without zeroing them when the file grows
+    // again, and titles rely on it (Forza Motorsport recreates each installed file with CREATE_ALWAYS, then sets its
+    // end of file to the old size and expects the data back)
+    std::vector<uint8_t> released;
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
     File() : Object(ObjType::File) {}
     ~File() override {
@@ -170,6 +175,37 @@ void Complete(uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
 }
 
 }  // namespace
+
+// FILE_OBJECT bodies ObReferenceObjectByHandle hands out for files, by guest address. XAPI reads through them:
+// XGetFilePhysicalSortKey asks IoQueryVolumeInformation for the file system's name, then reads the driver's context at
+// FsContext (+0x08): on the disc (GDFX) its first dword is the file's start sector, on FATX the flags byte must have bit
+// 0 clear and +0x1C is the first cluster. The key only orders reads, so files off a disc image get a running number.
+// Not bound like dispatcher objects, whose stamp would land on FsContext.
+namespace {
+std::mutex g_file_objects_lock;
+std::map<uint32_t, std::weak_ptr<File>> g_file_objects;
+uint32_t g_next_sort_key = 0x100;
+
+bool OnGameDisc(const File& f) { return f.entry || Upper(f.xbox).rfind(kCdRom, 0) == 0; }
+}  // namespace
+
+uint32_t FileObjectBody(const ObjectRef& obj) {
+    auto f = std::static_pointer_cast<File>(obj);
+    std::lock_guard<std::mutex> lock(g_file_objects_lock);
+    if (f->guest) return f->guest;
+    uint32_t body = mem::AllocSystem(0x80);
+    uint32_t context = body + 0x40;
+    uint32_t key = f->entry ? uint32_t(f->entry->offset / 2048) : g_next_sort_key++;
+    G<uint16_t>(body) = 5;  // IO_TYPE_FILE
+    W32(body + 0x08, context);
+    if (OnGameDisc(*f))
+        W32(context, key);
+    else
+        W32(context + 0x1C, key);
+    f->guest = body;
+    g_file_objects[body] = f;
+    return body;
+}
 
 std::string ReadAnsiString(uint32_t str) {
     if (!str) return {};
@@ -406,6 +442,15 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         IoStatus(iosb, kObjectPathNotFound, 0);
         return kObjectPathNotFound;
     }
+    std::vector<uint8_t> released;
+    constexpr uint64_t kMaxReleased = 256ull << 20;
+    if (exists && (disposition == 0 || disposition == 4 || disposition == 5)) {
+        uint64_t old_size = fs::file_size(host, ec);
+        if (!ec && old_size <= kMaxReleased) {
+            std::ifstream old_file(host, std::ios::binary);
+            released.assign(std::istreambuf_iterator<char>(old_file), {});
+        }
+    }
     FILE* fp = std::fopen(host.c_str(), mode);
     if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
     if (!fp) {
@@ -418,6 +463,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->xbox = Normalize(name);
     f->fp = fp;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+    f->released = std::move(released);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -456,6 +502,10 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
 // I/O completes before the call returns: the status block is written, then the file object, the event and the
 // APC are signalled (GetOverlappedResult without an event waits on the file handle)
 static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
+    // as NT's I/O manager: a request that fails at once with an error status leaves the status block alone and neither
+    // signals nor queues anything. Forza Motorsport primes a second overlapped read past the end of a small file and
+    // only works because that read never completes; completing it with STATUS_END_OF_FILE stops it with a disc error.
+    if ((status & 0xC0000000) == 0xC0000000) return status;
     IoStatus(iosb, status, n);
     SetEvent(f);
     Complete(event, apc, apc_ctx, iosb);
@@ -489,7 +539,10 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     }
     f->pos = pos + n;
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
-    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
+    if (!write && len && !n) {
+        LOG_FIRST(64, "read at end of file: %s at %llu, %u bytes", f->xbox.c_str(), (unsigned long long)pos, len);
+        return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
+    }
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
 }
 
@@ -560,7 +613,16 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
                 std::lock_guard<std::mutex> lock(f->io);
                 std::fflush(f->fp);
                 uint64_t size = fs::file_size(f->host, ec);
-                if (cls == 20 || R64(in) < size) fs::resize_file(f->host, R64(in), ec);
+                uint64_t want = R64(in);
+                if (cls == 20 || want < size) fs::resize_file(f->host, want, ec);
+                // growing over what an overwrite released brings those bytes back, as FATX does
+                if (cls == 20 && want > size && size < f->released.size()) {
+                    uint64_t end = std::min<uint64_t>(want, f->released.size());
+                    Seek(f->fp, size);
+                    std::fwrite(f->released.data() + size, 1, size_t(end - size), f->fp);
+                    std::fflush(f->fp);
+                    Seek(f->fp, f->pos);
+                }
             }
             break;
         case 13:  // disposition
@@ -587,16 +649,18 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
     return kSuccess;
 }
 
-KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
-    uint32_t iosb = a[1], out = a[2], len = a[3], cls = a[4];
+// Volume information as a fixed FATX volume: 16 GiB total, 8 GiB free in 16 KiB units. Writes the class to out and
+// returns the status and the bytes written.
+static uint32_t QueryVolume(uint32_t out, uint32_t len, uint32_t cls, uint32_t& written) {
     std::memset(HostPtr(out), 0, len);
+    written = 0;
     switch (cls) {
-        case 3:  // FileFsSizeInformation: 16 GiB total, 8 GiB free in 16 KiB units
+        case 3:  // FileFsSizeInformation
             W64(out, 0x100000);
             W64(out + 8, 0x80000);
             W32(out + 0x10, 32);
             W32(out + 0x14, 512);
-            IoStatus(iosb, kSuccess, 0x18);
+            written = 0x18;
             return kSuccess;
         case 7:  // FileFsFullSizeInformation
             W64(out, 0x100000);
@@ -604,23 +668,60 @@ KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
             W64(out + 0x10, 0x80000);
             W32(out + 0x18, 32);
             W32(out + 0x1C, 512);
-            IoStatus(iosb, kSuccess, 0x20);
+            written = 0x20;
             return kSuccess;
         case 1:  // FileFsVolumeInformation
             W32(out + 8, 0x12345678);  // VolumeSerialNumber
-            IoStatus(iosb, kSuccess, 0x18);
+            written = 0x18;
             return kSuccess;
         case 5:  // FileFsAttributeInformation: attributes, max name, name length, "FATX"
             W32(out, 0);
             W32(out + 4, 42);
             W32(out + 8, 4);
             std::memcpy(HostPtr(out + 12), "FATX", 4);
-            IoStatus(iosb, kSuccess, 16);
+            written = 16;
             return kSuccess;
         default:
-            LOG_FIRST(8, "NtQueryVolumeInformationFile: class %u", cls);
             return kInvalidParameter;
     }
+}
+
+KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
+    uint32_t iosb = a[1], out = a[2], len = a[3], cls = a[4], written = 0;
+    uint32_t status = QueryVolume(out, len, cls, written);
+    if (status != kSuccess) {
+        LOG_FIRST(8, "NtQueryVolumeInformationFile: class %u", cls);
+        return status;
+    }
+    IoStatus(iosb, kSuccess, written);
+    return kSuccess;
+}
+
+// IoQueryVolumeInformation(FileObject, FsInformationClass, Length, FsInformation, ReturnedLength): the file object's
+// volume, answered like NtQueryVolumeInformationFile
+KERNEL_EXPORT(76, IoQueryVolumeInformation, 5) {
+    uint32_t cls = a[1], len = a[2], out = a[3], returned = a[4], written = 0;
+    std::shared_ptr<File> f;
+    {
+        std::lock_guard<std::mutex> lock(g_file_objects_lock);
+        auto it = g_file_objects.find(a[0]);
+        if (it != g_file_objects.end()) f = it->second.lock();
+    }
+    if (f && OnGameDisc(*f) && cls == 5) {  // FileFsAttributeInformation of the disc's file system
+        std::memset(HostPtr(out), 0, len);
+        W32(out + 4, 255);
+        W32(out + 8, 4);
+        std::memcpy(HostPtr(out + 12), "GDFX", 4);
+        if (returned) W32(returned, 16);
+        return kSuccess;
+    }
+    uint32_t status = QueryVolume(out, len, cls, written);
+    if (status != kSuccess) {
+        LOG_FIRST(8, "IoQueryVolumeInformation: class %u", cls);
+        return status;
+    }
+    if (returned) W32(returned, written);
+    return kSuccess;
 }
 
 KERNEL_EXPORT(207, NtQueryDirectoryFile, 10) {

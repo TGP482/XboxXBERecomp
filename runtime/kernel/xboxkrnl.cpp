@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -73,7 +74,19 @@ uint64_t InterruptTime() {
     return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
 }
 
+// one processor: no DPC runs while a thread is at dispatch level or above, and titles rely on it (XACT raises to keep
+// its timer DPC off the lists it edits). DPCs run on a host thread of their own here, so dispatch level is a lock,
+// held by a thread from its raise to its lower and by the DPC thread around each routine.
+std::mutex g_dispatch_level;
+
 }  // namespace
+
+void SetIrql(uint8_t irql) {
+    uint8_t& cur = Irql();
+    if (cur < 2 && irql >= 2) g_dispatch_level.lock();
+    if (cur >= 2 && irql < 2) g_dispatch_level.unlock();
+    cur = irql;
+}
 
 uint32_t g_tick_count_va = 0;
 uint32_t g_launch_data_page_va = 0;
@@ -191,25 +204,25 @@ KERNEL_EXPORT(122, KeLeaveCriticalRegion, 0) { return 0; }
 
 KERNEL_FASTCALL(160, KfRaiseIrql) {
     uint8_t old = Irql();
-    Irql() = uint8_t(ctx.ecx);
+    SetIrql(uint8_t(ctx.ecx));
     return old;
 }
 
 KERNEL_FASTCALL(161, KfLowerIrql) {
-    Irql() = uint8_t(ctx.ecx);
+    SetIrql(uint8_t(ctx.ecx));
     return 0;
 }
 
 KERNEL_EXPORT(129, KeRaiseIrqlToDpcLevel, 0) {
     uint8_t old = Irql();
-    Irql() = 2;
+    SetIrql(2);
     return old;
 }
 
 // one processor: synch level is dispatch level
 KERNEL_EXPORT(130, KeRaiseIrqlToSynchLevel, 0) {
     uint8_t old = Irql();
-    Irql() = 2;
+    SetIrql(2);
     return old;
 }
 
@@ -673,6 +686,10 @@ KERNEL_EXPORT(246, ObReferenceObjectByHandle, 3) {
     uint32_t h = a[0];
     ObjectRef o = h == 0xFFFFFFFE ? CurrentRef() : FromHandle(h);
     if (!o) return kInvalidHandle;
+    if (o->type == ObjType::File) {
+        W32(a[2], FileObjectBody(o));
+        return kSuccess;
+    }
     if (!o->guest) {
         uint32_t body = mem::AllocSystem(32);
         Bind(o, body);
@@ -986,8 +1003,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
     return n;
 }
 
-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
-    switch (a[0]) {
+static uint32_t DosError(uint32_t status) {
+    switch (status) {
         case kSuccess: return 0;
         case kPending: return 997;
         case kTimeout: return 1460;
@@ -1010,8 +1027,20 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
         case kNotADirectory: return 267;
         case 0xC000007F: return 112;  // disk full
         case kDeviceNotConnected: return 1167;
-        default: return (a[0] & 0xC0000000) ? 317 : 0;
+        default: return (status & 0xC0000000) ? 317 : 0;
     }
+}
+
+KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return DosError(a[0]); }
+
+// NtUserIoApcDispatcher(ApcContext, IoStatusBlock, Reserved): the APC XAPI's ReadFileEx and WriteFileEx queue. The
+// context is the title's completion routine, called with the Win32 error, the bytes moved and the OVERLAPPED, whose
+// first member is the status block.
+KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
+    uint32_t routine = a[0], iosb = a[1];
+    uint32_t status = R32(iosb), moved = R32(iosb + 4);
+    CallGuest(ctx, routine, {status == kSuccess ? 0 : DosError(status), moved, iosb});
+    return 0;
 }
 
 // exceptions, debug, shutdown
@@ -1321,7 +1350,22 @@ KERNEL_EXPORT(339, XcRC4Crypt, 3) {
     crypto::Rc4Crypt(HostPtr(a[0]), static_cast<uint8_t*>(HostPtr(a[2])), a[1]);
     return 0;
 }
-KERNEL_EXPORT(346, XcDESKeyParity, 2) { return 0; }
+// (key, length): every byte gets odd parity in its low bit, as DES keys carry it
+KERNEL_EXPORT(346, XcDESKeyParity, 2) {
+    uint8_t* key = static_cast<uint8_t*>(HostPtr(a[0]));
+    for (uint32_t i = 0; i < a[1]; i++) {
+        uint8_t high = key[i] & 0xFE;
+        key[i] = high | uint8_t(!(std::popcount(high) & 1));
+    }
+    return 0;
+}
+// A public key starts with the BSAFE header: "RSA1", the modulus buffer's length in bytes (the bits / 8 plus 8,
+// 264 for the 2048 bit XePublicKeyData), the bits, the most data bytes and the exponent; the length sizes the
+// buffers XcPKEncPublic and XcVerifyPKCS1Signature take. Only the online stack asks.
+KERNEL_EXPORT(343, XcPKGetKeyLen, 1) {
+    constexpr uint32_t kRsa1 = 0x31415352;
+    return R32(a[0]) == kRsa1 ? R32(a[0] + 4) : 0;
+}
 KERNEL_EXPORT(347, XcKeyTable, 3) { return 0; }
 KERNEL_EXPORT(349, XcBlockCryptCBC, 7) {
     // only the online stack encrypts with DES; plain copy keeps buffers defined

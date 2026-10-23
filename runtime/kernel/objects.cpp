@@ -333,7 +333,9 @@ void RunDpcs(X86Context& ctx) {
         uint32_t dpc = d[0];
         G<uint8_t>(dpc + 2) = 0;  // Inserted
         uint32_t routine = R32(dpc + 0x0C), context = R32(dpc + 0x10);  // KDPC.DeferredRoutine and DeferredContext
+        SetIrql(2);
         if (routine) CallGuest(ctx, routine, {dpc, context, d[1], d[2]});
+        SetIrql(0);
     }
 }
 

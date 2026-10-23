@@ -123,6 +123,7 @@ bool CloseHandle(uint32_t handle);
 uint32_t DuplicateHandle(uint32_t handle);
 ObjectRef FromPointer(uint32_t guest);  // dispatcher object in guest memory, created on first use
 void Bind(ObjectRef obj, uint32_t guest);
+uint32_t FileObjectBody(const ObjectRef& file);  // FILE_OBJECT shaped body of a file, files.cpp
 ObjectRef FindNamed(const std::string& name);
 void AddNamed(const std::string& name, ObjectRef obj);
 
@@ -139,6 +140,7 @@ int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                           // system time, 100 ns since 1601
 int64_t ToDeadline(int64_t due_100ns);        // relative or absolute to a steady clock deadline in ns
 void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
+void SetIrql(uint8_t irql);  // the current thread's; dispatch level and above keep DPCs from running
 struct Thread;
 // apc_routine runs on apc_thread with (apc_context, due low, due high) each time the timer fires
 void SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std::shared_ptr<Thread> apc_thread = nullptr,
