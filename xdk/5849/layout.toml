@@ -33,6 +33,12 @@ CDevice_VBlankCount       = 0x1DE8 # the vertical blank handler 0x4A2FD1 increme
 CDevice_Field             = 0x1DF8 # the vertical blank handler 0x4A3034 stores the field at miniport + 0x1D0; Black D3DDevice_GetDisplayFieldStatus 0x26B62F reads it
 CDevice_GammaRamps        = 0x1E04 # D3DDevice_SetGammaRamp 0x49A413 copies to miniport + 0x1DC + index * 0x300; Black 0x176476
 CDevice_GammaPending      = 0x2404 # D3DDevice_SetGammaRamp 0x49A441 sets [miniport + 0x7DC + index * 4]; Black 0x17648F
+CDevice_MultiSampleType   = 0x196C # Forza Motorsport: the frame buffer init 0x3C08AB stores the present parameters' MultiSampleType (0x11 for none), D3DDevice_SetBackBufferScale 0x3BCD48 multiplies by its sample counts
+CDevice_FrameBufferCount  = 0x1A10 # Forza Motorsport: the frame buffer init 0x3C0859 stores BackBufferCount + 1, then 0x3C0923 the buffers from CDevice_BackBuffer on; Swap's copy 0x3BC930 tests it against 3
+CDevice_SwapEffect        = 0x1970 # Forza Motorsport: the frame buffer init 0x3C0849 stores the present parameters' SwapEffect; D3DDevice_SetBackBufferScale 0x3BCD89 leaves the Swap filter flag alone for 3 (D3DSWAPEFFECT_COPY)
+CDevice_GridSize          = 0x954  # Forza Motorsport: the surface update 0x3B8615 stores the width the target is drawn at on the GPU's grid, 0x3B861B the height at +4; D3DDevice_SetViewport 0x3B9B58 and D3DDevice_SetScissors 0x3BA197 clamp to them
+CDevice_SuperSampleMin    = 0x964  # Forza Motorsport: the surface update 0x3B866E stores the smaller of CDevice_SuperSampleX and Y, D3DDevice_SetRenderState_LineWidth 0x3B7A35 scales by it
+CDevice_SuperSampleLog2   = 0x968  # Forza Motorsport: the surface update 0x3B8689 stores the log2 of CDevice_SuperSampleMin, looked up in a table (0x3C65C4)
 # D3D8 globals
 DirtyFlags_Texture    = 0x4800  # D3DDevice_SetTexture 0x49B147 ors it into D3D__DirtyFlags
 TextureState_Stage    = 32      # D3DDevice_SetTextureStageStateNotInline 0x49FA4B: [stage * 32 + type] dwords

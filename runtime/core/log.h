@@ -15,6 +15,11 @@ void Write(Level lv, const char* fmt, ...) __attribute__((format(printf, 2, 3)))
 void Flush();
 const std::string& Path();
 
+// called with the text of every line before the level is checked, so a release build without XBE_VERBOSE shows an
+// observer the lines it does not write; from any thread, and it must not log or wait on a lock a logging thread holds.
+// nullptr removes it.
+void SetObserver(void (*observer)(const char* message));
+
 #ifdef NDEBUG
 inline constexpr bool kVerbose = false;
 #else

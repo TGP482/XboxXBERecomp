@@ -110,6 +110,10 @@ enum : uint32_t {
     kMPsDotMapping = 0x1E74,
     kMPsInputTexture = 0x1E78,
     kMDepthClipControl = 0x1D78,
+    // polygon stipple: D3DRS_STIPPLEENABLE is a simple state, D3DDevice_SetStipple pushes the 32 rows of the
+    // pattern itself (rows at y mod 32, a row's bit 31 at x mod 32 = 0)
+    kMStippleEnable = 0x147C,
+    kMStipplePattern = 0x1480,   // 32
     // visibility tests, sent as raw commands rather than render states
     kMClearReport = 0x17C8,
     kMCountEnable = 0x17CC,
@@ -185,6 +189,16 @@ struct State {
     uint32_t light_enable = 0;                         // bit per light
     float ss_offset_x = 0, ss_offset_y = 0;
     float zscale = 16777215.0f;  // depth buffer units per 1.0
+    // D3DDevice_SetDepthClipPlanes: near and far in depth buffer units, for fixed function (0, 1) and vertex programs
+    // (2, 3), and which apply (bit 0 fixed function, bit 1 vertex programs); otherwise depth clips at 0 and zscale
+    std::array<float, 4> zplanes{};
+    uint32_t zplanes_set = 0;
+    // samples a pixel across and down of the render target and its depth buffer: the multisampled back buffer's while
+    // the device's back buffer is the target (the console's test), else 1; the console draws on a grid that much smaller
+    uint32_t aa_x = 1, aa_y = 1;
+    // D3D's scaling of the title's coordinates onto that grid (supersampling, a back buffer scale other than 1): the
+    // viewport, scissors and clear rects come scaled, screen space vertices are scaled when drawn
+    float ss_x = 1, ss_y = 1;
 };
 
 }  // namespace gpu

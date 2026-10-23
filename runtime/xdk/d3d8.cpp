@@ -3,7 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,6 +46,10 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #define SYM_D3DDevice_SetPalette FFFFFE02
 #define HAS_D3DDevice_SetPalette 0
 #endif
+#ifndef SYM_D3DDevice_UpdateOverlay
+#define SYM_D3DDevice_UpdateOverlay FFFFFE0B
+#define HAS_D3DDevice_UpdateOverlay 0
+#endif
 #ifndef SYM_D3DDevice_GetVertexShaderFunction
 #define SYM_D3DDevice_GetVertexShaderFunction FFFFFE03
 #define HAS_D3DDevice_GetVertexShaderFunction 0
@@ -71,6 +81,14 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #ifndef SYM_D3D_BlockOnNonSurfaceResource
 #define SYM_D3D_BlockOnNonSurfaceResource FFFFFE0A
 #define HAS_D3D_BlockOnNonSurfaceResource 0
+#endif
+#ifndef SYM_D3DDevice_SetBackBufferScale
+#define SYM_D3DDevice_SetBackBufferScale FFFFFE0C
+#define HAS_D3DDevice_SetBackBufferScale 0
+#endif
+#ifndef SYM_D3DDevice_SetDepthClipPlanes
+#define SYM_D3DDevice_SetDepthClipPlanes FFFFFE0D
+#define HAS_D3DDevice_SetDepthClipPlanes 0
 #endif
 
 namespace d3d {
@@ -113,11 +131,28 @@ std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
 std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
 uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
+// A multisampled or supersampled device (MultiSampleType with 0x1000 or 0x2000 set) keeps the library's frame buffers:
+// the back buffer holds several samples a pixel, Swap filters it into a front buffer, and the front buffers take turns
+// on screen. The device's buffer slots hold them; g_buffers is unused.
+bool g_aa = false;
+uint32_t g_aa_fronts = 0;  // 1 or 2
+uint32_t g_aa_x = 1, g_aa_y = 1;  // samples a pixel across and down
+// SetBackBufferScale's factors times those samples (device +0x96C): the part of the back buffer drawn, in front buffer
+// pixels' worth of back buffer pixels. D3D's scaling of the title's coordinates onto the GPU's grid (+0x95C) follows
+// from it while the back buffer is the target; UpdateSurface works it out.
+float g_scale_x = 1, g_scale_y = 1;
+float g_ss_x = 1, g_ss_y = 1;
+// the title's viewport and scissor rects in its own coordinates; g_state holds them on the grid
+gpu::Viewport g_viewport;
+std::array<int32_t, 4 * 8> g_scissors{};
+uint32_t g_display_w = 640, g_display_h = 480;
 uint32_t g_scratch_push = 0, g_scratch_size = 0;
 uint32_t g_walk = 0;  // first scratch command not read yet
 
 uint32_t Dev(uint32_t off) { return R32(kDevice + off); }
 void SetDev(uint32_t off, uint32_t v) { W32(kDevice + off, v); }
+uint32_t FrontBuffer() { return g_aa ? Dev(kDevFrontBuffer) : g_buffers[0]; }
+uint32_t BackBuffer() { return g_aa ? Dev(kDevBackBuffer) : g_buffers[1]; }
 
 // The device's own references: a count in bits 19 to 22 of the resource's first dword. A surface's first one
 // also holds its parent. The library's functions do it when the image has them, inlined ones are done here.
@@ -192,6 +227,15 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
     return hdr;
 }
 
+// the device's own header for a frame buffer surface the title supplied, as the library's frame buffer init copies them
+uint32_t CopySurface(uint32_t from) {
+    uint32_t hdr = mem::AllocSystem(24);
+    std::memcpy(HostPtr(hdr), HostPtr(from), 24);
+    W32(hdr + 0, 0x000D0001);  // surface, one reference, one internal reference held by the device
+    W32(hdr + 20, 0);
+    return hdr;
+}
+
 void SyncDeferred() {
     // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
     for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
@@ -206,30 +250,144 @@ float ZScale(const gpu::Surface& zs) {
 
 bool g_own_constants = false;  // D3DSCM_NORESERVEDCONSTANTS: c-38 and c-37 are the title's
 
-// c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them
+// a title coordinate on the grid, rounded as D3D does
+int32_t Grid(int64_t v, float scale) { return int32_t(double(v) * scale + 0.5); }
+
+// the title's scissor rects on the grid, as D3D scales them for the GPU (Forza Motorsport's SetScissors 0x3BA000)
+void UpdateScissors() {
+    for (uint32_t i = 0; i < g_state.scissor_count * 4; i++)
+        g_state.scissors[i] = uint32_t(Grid(g_scissors[i], i & 1 ? g_ss_y : g_ss_x));
+}
+
+// The title's viewport on the grid, as D3D scales it for the GPU, with the scissors. c-38 and c-37 hold the viewport
+// scale and offset, as D3D_GetViewportOffsetAndScale computes them.
 void UpdateViewportConstants() {
+    const auto& t = g_viewport;
     auto& v = g_state.viewport;
+    int32_t x0 = Grid(t.x, g_ss_x), y0 = Grid(t.y, g_ss_y);
+    v = {uint32_t(x0), uint32_t(y0), uint32_t(Grid(int64_t(t.x) + t.w, g_ss_x) - x0),
+         uint32_t(Grid(int64_t(t.y) + t.h, g_ss_y) - y0), t.min_z, t.max_z};
+    UpdateScissors();
     g_state.zscale = ZScale(g_state.zs);
     float hw = v.w * 0.5f, hh = v.h * 0.5f;
     if (!g_own_constants) {
         g_state.vsc[58] = {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0};
         g_state.vsc[59] = {v.x + g_state.ss_offset_x + hw, v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
     }
-    // the viewport as the library's SetViewport stores it, for inlined readers
+    // the viewport as the library's SetViewport stores it, in the title's coordinates, for inlined readers
     if (XDK_CDevice_Viewport != xdk::kUnknown) {
         uint32_t p = kDevice + XDK_CDevice_Viewport;
-        W32(p, v.x);
-        W32(p + 4, v.y);
-        W32(p + 8, v.w);
-        W32(p + 12, v.h);
-        std::memcpy(HostPtr(p + 16), &v.min_z, 4);
-        std::memcpy(HostPtr(p + 20), &v.max_z, 4);
+        W32(p, t.x);
+        W32(p + 4, t.y);
+        W32(p + 8, t.w);
+        W32(p + 12, t.h);
+        std::memcpy(HostPtr(p + 16), &t.min_z, 4);
+        std::memcpy(HostPtr(p + 20), &t.max_z, 4);
     }
 }
 
 void SetComplex(uint32_t rs, uint32_t v) {
     g_state.rs[rs] = v;
     W32(kRenderState + rs * 4, v);
+}
+
+uint32_t g_grid_w = 640, g_grid_h = 480;  // what of the target the title draws, on the grid (device +0x954)
+
+// The library's surface update (Forza Motorsport 0x3B83F0), run when the target, a multisample mode or the back buffer
+// scale changes. With the device's back buffer as the target the title draws over the front buffers' size times the
+// back buffer scale, kept inside the back buffer. A multisample mode (D3DRS_MULTISAMPLEMODE, which the frame buffer
+// init sets to 1 for MultiSampleType 0x1021 and to 2 for the other multisampled types) has the GPU draw that two
+// samples a pixel across, or across and down, on a grid of half the size; D3D scales the title's coordinates onto the
+// grid by what is left, which is how supersampling and scales other than 1 are drawn. Other targets are drawn at their
+// own size, multisampled by D3DRS_MULTISAMPLERENDERTARGETMODE; swizzled ones never are. A multisampled target sets
+// device flag 0x8000, with which D3D_GetViewportOffsetAndScale moves the viewport half a pixel up and left under
+// D3DRS_MULTISAMPLEANTIALIAS.
+void UpdateSurface() {
+    uint32_t rt = Dev(kDevRenderTarget), back = Dev(kDevBackBuffer);
+    if (!rt) return;
+    uint32_t w, h, mode;
+    float sx = 1, sy = 1;
+    gpu::SurfaceSize(SurfaceOf(rt), w, h);
+    if (rt == back) {
+        uint32_t fw, fh;
+        gpu::SurfaceSize(SurfaceOf(Dev(kDevFrontBuffer)), fw, fh);
+        sx = g_scale_x;
+        sy = g_scale_y;
+        w = std::min(uint32_t(fw * double(sx) + 0.5), w);
+        h = std::min(uint32_t(fh * double(sy) + 0.5), h);
+        mode = R32(kRenderState + gpu::kRsMultiSampleMode * 4);
+    } else {
+        mode = R32(kRenderState + gpu::kRsMultiSampleRenderTargetMode * 4);
+    }
+    uint32_t ax = 1, ay = 1;
+    if (mode && !gpu::Format(R32(rt + 12) >> 8 & 0xFF).swizzled) {
+        ax = 2;
+        w = (w + 1) / 2;
+        sx *= 0.5f;
+        if (mode == 2) {
+            ay = 2;
+            h = (h + 1) / 2;
+            sy *= 0.5f;
+        }
+    }
+    if (XDK_CDevice_Flags != xdk::kUnknown)
+        SetDev(XDK_CDevice_Flags, ax > 1 ? Dev(XDK_CDevice_Flags) | 0x8000 : Dev(XDK_CDevice_Flags) & ~0x8000u);
+    g_state.aa_x = ax;
+    g_state.aa_y = ay;
+    g_state.ss_x = g_ss_x = sx;
+    g_state.ss_y = g_ss_y = sy;
+    g_grid_w = w;
+    g_grid_h = h;
+    // the device's record, which the library code a title keeps reads (Forza Motorsport calls
+    // D3DDevice_GetViewportOffsetAndScale, 0x3B7590)
+    std::memcpy(HostPtr(kDevice + kDevSuperX), &sx, 4);
+    std::memcpy(HostPtr(kDevice + kDevSuperY), &sy, 4);
+    if (XDK_CDevice_GridSize != xdk::kUnknown) {
+        SetDev(XDK_CDevice_GridSize, w);
+        SetDev(XDK_CDevice_GridSize + 4, h);
+    }
+    float least = std::min(sx, sy), least_log2 = std::log2(least);
+    if (XDK_CDevice_SuperSampleMin != xdk::kUnknown)
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_SuperSampleMin), &least, 4);
+    if (XDK_CDevice_SuperSampleLog2 != xdk::kUnknown)
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_SuperSampleLog2), &least_log2, 4);
+}
+
+// The viewport SetViewport stores (Forza Motorsport 0x3B9A40): kept inside the target, which for the back buffer is the
+// front buffers' size, and inside what of it the grid holds
+void SetTitleViewport(uint32_t x, uint32_t y, uint32_t w, uint32_t h, float min_z, float max_z) {
+    uint32_t rt = Dev(kDevRenderTarget), sw = 640, sh = 480;
+    if (rt) gpu::SurfaceSize(SurfaceOf(rt == Dev(kDevBackBuffer) ? Dev(kDevFrontBuffer) : rt), sw, sh);
+    uint32_t right = uint32_t(std::min<uint64_t>(uint64_t(x) + w, sw));
+    uint32_t bottom = uint32_t(std::min<uint64_t>(uint64_t(y) + h, sh));
+    if (Grid(right, g_ss_x) > int32_t(g_grid_w)) right = uint32_t(g_grid_w / g_ss_x);
+    if (Grid(bottom, g_ss_y) > int32_t(g_grid_h)) bottom = uint32_t(g_grid_h / g_ss_y);
+    g_viewport = {x, y, right > x ? right - x : 0, bottom > y ? bottom - y : 0, min_z, max_z};
+    UpdateViewportConstants();
+}
+
+// the whole target, as the library's SetRenderTarget sets it (its viewport 0x3C666C is 0, 0, 0x7FFFFFFF, 0x7FFFFFFF)
+void SetWholeViewport() { SetTitleViewport(0, 0, 0x7FFFFFFF, 0x7FFFFFFF, 0.0f, 1.0f); }
+
+// the library's SetViewport(NULL) after a surface update: the viewport kept and put on the new grid, the scissors reset
+void ReapplyViewport() {
+    g_state.scissor_count = 0;
+    UpdateViewportConstants();
+}
+
+// D3DRS_MULTISAMPLEMODE (the back buffer's) and D3DRS_MULTISAMPLERENDERTARGETMODE (other targets'): the library
+// updates the surface when the mode is the target's (Forza Motorsport 0x3B8B00, 0x3B8B30)
+void SetMultiSampleMode(uint32_t rs, uint32_t v) {
+    if (rs == gpu::kRsMultiSampleMode && diag::MultiSampleType()) {
+        LOG_FIRST(1, "d3d: D3DRS_MULTISAMPLEMODE %u from the title ignored (XBE_MULTISAMPLE_TYPE)", v);
+        return;
+    }
+    SetComplex(rs, v);
+    bool back = Dev(kDevRenderTarget) == Dev(kDevBackBuffer);
+    if (back == (rs == gpu::kRsMultiSampleMode)) {
+        UpdateSurface();
+        ReapplyViewport();
+    }
 }
 
 // The library's default render and texture stage states; its pushes land in the scratch buffer
@@ -251,40 +409,92 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
     if (!h) h = 480;
     LOGI("d3d: %s %ux%u format %X buffers %u depth %u format %X interval %X flags %X", caller, w, h, fmt, count,
          auto_depth, depth_fmt, interval, R32(pp + 0x28));
-    uint32_t color_fmt = gpu::LinearColorFormat(fmt);
+    uint32_t color_fmt = gpu::LinearColorFormat(fmt), n = std::min<uint32_t>(count + 1, 3);
     uint32_t zf = auto_depth ? gpu::LinearDepthFormat(depth_fmt) : 0;
-    // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset
-    static std::array<uint32_t, 5> made{};
-    std::array<uint32_t, 5> asked{w, h, color_fmt, std::min<uint32_t>(count + 1, 3), zf};
+    uint32_t zbpp = zf == 0x30 || zf == 0x31 ? 2 : 4;  // 0x30 LIN_D16, 0x31 LIN_F16
+    // MultiSampleType: samples across in bits 4 to 7, down in bits 0 to 3, in a back buffer that many times the front
+    // buffers' size; with 0x1000 the GPU draws it multisampled, with 0x2000 D3D's scaling supersamples (UpdateSurface)
+    uint32_t multisample = R32(pp + 0x10);
+    if (uint32_t forced = diag::MultiSampleType()) {
+        LOGW("d3d: MultiSampleType %X in place of the title's %X (XBE_MULTISAMPLE_TYPE)", forced, multisample);
+        multisample = forced;
+    }
+    uint32_t ax = multisample >> 4 & 0xF, ay = multisample & 0xF;
+    bool aa = (multisample & 0x3000) && ax && ay && ax * ay > 1;
+    // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset. A
+    // multisampled device's shape takes in its type and the surfaces the title supplies.
+    static std::array<uint32_t, 10> made{};
+    static std::array<uint32_t, 3> aa_buffers{};  // a multisampled device's back buffer, then its front buffers
+    std::array<uint32_t, 10> asked{w, h, color_fmt, n, zf, aa ? multisample : 0};
+    for (uint32_t i = 0; aa && i < 4; i++) asked[6 + i] = R32(pp + 0x34 + i * 4);
     if (asked != made) {
         made = asked;
-        g_buffer_count = asked[3];
-        for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
-        g_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;  // 0x30 LIN_D16, 0x31 LIN_F16
+        g_aa = aa;
+        if (aa) {
+            // BufferSurfaces: the back buffer, then the front buffers; DepthStencilSurface. Those the title supplies are
+            // copied into the device's own headers, the rest made at the back buffer's or the display's size.
+            aa_buffers = {};
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t given = R32(pp + 0x34 + i * 4);
+                aa_buffers[i] = given ? CopySurface(given)
+                                : i   ? NewSurface(w, h, color_fmt, 4)
+                                      : NewSurface(w * ax, h * ay, color_fmt, 4);
+            }
+            g_aa_fronts = n - 1;
+            uint32_t given = R32(pp + 0x40);
+            g_depth = given ? CopySurface(given) : zf ? NewSurface(w * ax, h * ay, zf, zbpp) : 0;
+            LOGI("d3d: %s back buffer %ux%u (type %X), %u front buffers, %s",
+                 multisample & 0x1000 ? "multisampled" : "supersampled", w * ax, h * ay, multisample, g_aa_fronts,
+                 R32(pp + 0x34) ? "supplied by the title" : "made here");
+        } else {
+            g_buffer_count = n;
+            for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
+            g_depth = zf ? NewSurface(w, h, zf, zbpp) : 0;
+        }
     }
+    g_aa_x = aa ? ax : 1;
+    g_aa_y = aa ? ay : 1;
+    g_display_w = w;
+    g_display_h = h;
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
         if (!g_backend->Init(w, h)) LOGE("d3d: renderer init failed");
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
-    g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
-    SetDev(kDevRenderTarget, g_buffers[1]);
+    uint32_t back = aa ? aa_buffers[0] : g_buffers[1];
+    SetDev(kDevRenderTarget, back);
     SetDev(kDevDepth, g_depth);
-    SetDev(kDevBackBuffer, g_buffers[1]);
-    SetDev(kDevFrontBuffer, g_buffers[1]);
-    float one = 1.0f, zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
-    std::memcpy(HostPtr(kDevice + kDevSuperX), &one, 4);
-    std::memcpy(HostPtr(kDevice + kDevSuperY), &one, 4);
+    SetDev(kDevBackBuffer, back);
+    if (aa) {
+        for (uint32_t i = 1; i < 3; i++) SetDev(kDevFrontBuffer + (i - 1) * 4, aa_buffers[i]);
+    } else {
+        SetDev(kDevFrontBuffer, back);
+    }
+    // the frame buffer init's record of the buffers and samples, which SetBackBufferScale and Swap's copy read
+    if (XDK_CDevice_FrameBufferCount != xdk::kUnknown)
+        SetDev(XDK_CDevice_FrameBufferCount, aa ? g_aa_fronts + 1 : g_buffer_count);
+    if (XDK_CDevice_MultiSampleType != xdk::kUnknown) SetDev(XDK_CDevice_MultiSampleType, aa ? multisample : 0x11);
+    if (XDK_CDevice_SwapEffect != xdk::kUnknown) SetDev(XDK_CDevice_SwapEffect, R32(pp + 0x14));
+    if (XDK_CDevice_Flags != xdk::kUnknown)  // 0x4000: Swap filters
+        SetDev(XDK_CDevice_Flags, aa ? Dev(XDK_CDevice_Flags) | 0x4000 : Dev(XDK_CDevice_Flags) & ~0x4000u);
+    // the GPU's multisample mode, which the default states leave to the frame buffer init: 1 for two samples across
+    // (MultiSampleType 0x1021, 0x1121), 2 for two across and down
+    SetComplex(gpu::kRsMultiSampleMode, aa && (multisample & 0x1000) ? ((multisample & 0xFF) == 0x21 ? 1 : 2) : 0);
+    float zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
     std::memcpy(HostPtr(kDevice + kDevZScale), &zs, 4);
     // fields the library's init sets that inlined library code and the default states read
     if (XDK_CDevice_AutoDepth != xdk::kUnknown) SetDev(XDK_CDevice_AutoDepth, g_depth);
+    // the back buffer scale starts at 1: the samples across and down, as floats
+    g_scale_x = float(g_aa_x);
+    g_scale_y = float(g_aa_y);
     if (XDK_CDevice_BackBufferScale != xdk::kUnknown) {
-        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale), &one, 4);
-        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale + 4), &one, 4);
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale), &g_scale_x, 4);
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale + 4), &g_scale_y, 4);
     }
-    g_state.rt = SurfaceOf(g_buffers[1]);
+    g_state.rt = SurfaceOf(back);
     g_state.zs = SurfaceOf(g_depth);
-    UpdateViewportConstants();
+    UpdateSurface();
+    SetWholeViewport();
 }
 
 constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice_VBlankEvent != xdk::kUnknown &&
@@ -293,11 +503,29 @@ constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice
 // what the library's vertical blank interrupt leaves for the title: count, event, callback
 void VerticalBlank(X86Context& ctx) {
     using clock = std::chrono::steady_clock;
+    constexpr auto kPeriod = std::chrono::microseconds(16667);
     uint32_t info = mem::AllocSystem(12), shown = 0;
-    auto next = clock::now();
+    clock::time_point own_next = clock::now() + kPeriod, ticked_slot;
     for (;;) {
-        next = std::max(next + std::chrono::microseconds(16667), clock::now());
-        std::this_thread::sleep_until(next);
+        // While the title swaps, the blank comes half a frame after the swap's slot in the title's pacing, so a swap
+        // never races a blank: two clocks of the same rate beat, a frame sees no blank and the next two, and a title
+        // that counts blanks times its steps by them. Without a swap the blanks run on their own clock, and a frame
+        // that is late gets its extra blank.
+        auto now = clock::now();
+        clock::time_point slot = app::LastSwapSlot(), due;
+        bool swapping = slot != clock::time_point();
+        if (swapping && slot != ticked_slot && now >= slot + kPeriod / 2) {
+            due = slot + kPeriod / 2;
+            ticked_slot = slot;
+        } else if (now >= own_next) {
+            due = own_next;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        // the slack keeps the own clock behind the next swap's blank while the title swaps on time
+        own_next = std::max(due, now - kPeriod) + kPeriod;
+        if (swapping) own_next += std::chrono::milliseconds(2);
         uint32_t count = Dev(XDK_CDevice_VBlankCount) + 1, swaps = Dev(kDevSwapCount);
         SetDev(XDK_CDevice_VBlankCount, count);
         ObjectRef event = FromPointer(kDevice + XDK_CDevice_VBlankEvent);
@@ -430,7 +658,15 @@ HLE_STDCALL(D3DResource_IsBusy, 1) {
     // set on the device, a surface also through its texture
     uint32_t common = R32(res), parent = (common & 0x70000) == 0x50000 ? R32(res + 0x14) : 0;
     if ((common & 0x780000) || (parent && (R32(parent) & 0x780000))) return 1;  // internal reference count
-    return g_backend && g_backend->Busy(res) ? 1 : 0;
+    if (!g_backend) return 0;
+    if (g_backend->Busy(res)) return 1;
+    // Once IsBusy says no, a title may read what the GPU drew straight from memory, without a lock (Forza Motorsport
+    // measures its exposure from a render target it locked once, when it made it). So a texture or surface the GPU
+    // wrote stays busy while a copy of it is on its way to guest memory, as it would on the console until the GPU got
+    // there; the first ask starts the copy, and the title never waits on it.
+    uint32_t type = common & 0x70000;  // 0x40000 texture, 0x50000 surface
+    if ((type == 0x40000 || type == 0x50000) && g_backend->Fetching(mem::VirtualFromPhysical(R32(res + 4)))) return 1;
+    return 0;
 }
 HLE_STDCALL(D3D_BlockOnTime, 2) { return 0; }
 HLE_STDCALL(D3DDevice_BlockOnFence, 1) {
@@ -478,7 +714,7 @@ HLE_STDCALL(D3DDevice_GetRasterStatus, 1) {
     constexpr int64_t kFrameMicroseconds = 16667;
     constexpr uint32_t kBlankLines = 45;
     constexpr uint32_t kShownLines = 480;
-    uint32_t shown = g_buffers[0] ? (R32(g_buffers[0] + 0x10) >> 12 & 0xFFF) + 1 : kShownLines;
+    uint32_t front = FrontBuffer(), shown = front ? (R32(front + 0x10) >> 12 & 0xFFF) + 1 : kShownLines;
     uint32_t lines = shown + shown * kBlankLines / kShownLines;
     auto now = std::chrono::steady_clock::now().time_since_epoch();
     int64_t into_frame = std::chrono::duration_cast<std::chrono::microseconds>(now).count() % kFrameMicroseconds;
@@ -487,14 +723,51 @@ HLE_STDCALL(D3DDevice_GetRasterStatus, 1) {
     W32(a[0] + 4, line < shown ? line : 0);
     return 0;
 }
-HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }
-HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }
-HLE_STDCALL(D3DDevice_EnableOverlay, 1) { return 0; }
+// The TV encoder's vertical filters for interlaced output (flicker 0 to 5, the soft display filter on or off): they
+// soften the picture and leave its levels alone, and a progressive window has no fields to steady.
+HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) {
+    LOG_FIRST(4, "d3d: SetFlickerFilter %u (not reproduced)", a[0]);
+    return 0;
+}
+HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) {
+    LOG_FIRST(4, "d3d: SetSoftDisplayFilter %u (not reproduced)", a[0]);
+    return 0;
+}
+// The video overlay, shown over the frame at present: titles play movies on it (Forza Motorsport's Bink videos)
+static gpu::Overlay g_overlay;
+
+static void SendOverlay() {
+    g_overlay.display_w = g_display_w;
+    g_overlay.display_h = g_display_h;
+    if (g_backend) g_backend->SetOverlay(g_overlay);
+}
+
+HLE_STDCALL(D3DDevice_EnableOverlay, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_overlay.enabled = a[0] != 0;
+    if (!g_overlay.enabled) g_overlay.surface = {};
+    SendOverlay();
+    return 0;
+}
+// (surface, source RECT, destination RECT, enable color key, color key); a null rect is the whole surface or frame
+HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_overlay.enabled = true;
+    g_overlay.surface = SurfaceOf(a[0]);
+    for (int i = 0; i < 4; i++) {
+        g_overlay.src[i] = a[1] ? int32_t(R32(a[1] + i * 4)) : 0;
+        g_overlay.dst[i] = a[2] ? int32_t(R32(a[2] + i * 4)) : 0;
+    }
+    g_overlay.color_key = a[3] != 0;
+    g_overlay.key = a[4];
+    SendOverlay();
+    return 0;
+}
 // the front buffer, read back at the guest size, is kept for the next instance after a quick reboot, which may
 // fade from it at its first frames
 HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t front = g_buffers[0], size = R32(front + 0x10);
+    uint32_t front = FrontBuffer(), size = R32(front + 0x10);
     uint32_t pitch = ((size >> 24 & 0xFF) + 1) * 64, height = (size >> 12 & 0xFFF) + 1, bytes = pitch * height;
     uint32_t data = mem::VirtualFromPhysical(R32(front + 4));
     if (g_backend) g_backend->Sync(data, bytes);
@@ -504,10 +777,49 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
 }
 HLE_STDCALL(D3DDevice_FlushVertexCache, 0) { return 0; }
 
+// verbose: the gamma ramps a title sets (D3DGAMMARAMP, red, green and blue 256 bytes each), by what they make of a few
+// levels, to tell a brightness or contrast setting from the identity. A step of a fade (every level scaled by one
+// factor, the same in each channel) is only counted, and the count is logged when the identity comes back.
+static void LogGammaRamp(const uint8_t* ramp, const char* how) {
+    static std::mutex lock;
+    static uint8_t last[768];
+    static bool identity_logged = false;
+    static unsigned fade_steps = 0;
+    std::lock_guard<std::mutex> guard(lock);
+    bool identity = true, fade = true;
+    for (int i = 0; i < 768; i++) {
+        identity &= ramp[i] == (i & 0xFF);
+        fade &= ramp[i] == ramp[i & 0xFF] && std::abs(ramp[i & 0xFF] * 255 - (i & 0xFF) * ramp[255]) <= 255;
+    }
+    if (identity) {
+        if (!identity_logged) LOGI("d3d: gamma ramp (%s): identity, after %u fade steps", how, fade_steps);
+        identity_logged = true;
+        fade_steps = 0;
+        return;
+    }
+    identity_logged = false;
+    if (fade) {
+        fade_steps++;
+        return;
+    }
+    if (!std::memcmp(last, ramp, sizeof(last))) return;
+    std::memcpy(last, ramp, sizeof(last));
+    constexpr int kLevels[] = {0, 16, 32, 64, 128, 192, 235, 255};
+    std::string text;
+    for (int c = 0; c < 3; c++) {
+        text += c == 0 ? "red" : c == 1 ? ", green" : ", blue";
+        for (int level : kLevels) text += " " + std::to_string(ramp[c * 256 + level]);
+    }
+    LOGI("d3d: gamma ramp (%s), levels 0 16 32 64 128 192 235 255 become: %s", how, text.c_str());
+}
+
 // The library keeps the ramp in one of two device slots for GetGammaRamp: both get it, whichever one its index names
 HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
     uint8_t ramp[768];
     std::memcpy(ramp, HostPtr(a[1]), 768);
+    char how[32];
+    std::snprintf(how, sizeof(how), "SetGammaRamp, flags %X", a[0]);
+    LogGammaRamp(ramp, how);
     if (XDK_CDevice_GammaRamps != xdk::kUnknown)
         for (uint32_t slot = 0; slot < 2; slot++)
             std::memcpy(HostPtr(kDevice + XDK_CDevice_GammaRamps + slot * sizeof(ramp)), ramp, sizeof(ramp));
@@ -518,6 +830,16 @@ HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
 // targets and presentation
 
 namespace {
+// the stage's texture becomes tex, the references move from the old one
+void SetTextureStage(X86Context& ctx, uint32_t stage, uint32_t tex) {
+    uint32_t old = Dev(kDevTextures + stage * 4);
+    AddRef(ctx, tex);
+    SetDev(kDevTextures + stage * 4, tex);
+    Release(ctx, old);
+    g_state.textures[stage] = tex;
+    W32(kDirtyFlags, R32(kDirtyFlags) | XDK_DirtyFlags_Texture);
+}
+
 // the device's targets become rt and zs, the references move from the old ones
 void ApplyRenderTarget(X86Context& ctx, uint32_t rt, uint32_t zs) {
     AddRef(ctx, rt);
@@ -530,6 +852,8 @@ void ApplyRenderTarget(X86Context& ctx, uint32_t rt, uint32_t zs) {
     Release(ctx, old_zs);
     g_state.rt = SurfaceOf(rt);
     g_state.zs = SurfaceOf(zs);
+    // the console draws multisampled and scaled to the device's back buffer itself, not to other headers of its memory
+    UpdateSurface();
 }
 }  // namespace
 
@@ -538,23 +862,24 @@ HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
     uint32_t rt = a[0] ? a[0] : Dev(kDevRenderTarget);
     ApplyRenderTarget(ctx, rt, a[1]);
     // SetRenderTarget resets the viewport to the whole target
-    uint32_t w, h;
-    gpu::SurfaceSize(g_state.rt, w, h);
-    g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
-    UpdateViewportConstants();
+    SetWholeViewport();
     return 0;
 }
 
-// (rt, zs, flags): the surfaces alone, the viewport stays as it was
+// (rt, zs, flags): the surfaces alone, the viewport stays as it was, put on the new target's grid
 HLE_STDCALL(D3DDevice_SetRenderTargetFast, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    float sx = g_ss_x, sy = g_ss_y;
     ApplyRenderTarget(ctx, a[0], a[1]);
+    if (sx != g_ss_x || sy != g_ss_y) UpdateViewportConstants();
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_GetBackBuffer2, 1) {
     int32_t i = int32_t(a[0]);
-    uint32_t s = i < 0 ? g_buffers[0] : g_buffers[std::min<uint32_t>(uint32_t(i) + 1, g_buffer_count - 1)];
+    uint32_t s = g_aa    ? (i < 0 ? Dev(kDevFrontBuffer) : Dev(kDevBackBuffer))
+                 : i < 0 ? g_buffers[0]
+                         : g_buffers[std::min<uint32_t>(uint32_t(i) + 1, g_buffer_count - 1)];
     W32(s, R32(s) + 1);
     return s;
 }
@@ -573,6 +898,84 @@ HLE_STDCALL(D3DDevice_GetDepthStencilSurface2, 0) {
 
 namespace {
 std::atomic<uint32_t> g_presents{0};
+
+// D3DSWAP: 1 copy (filter the back buffer into the front buffer), 2 bypass the copy, 4 finish (show the front buffer);
+// 0 is copy and finish
+constexpr uint32_t kSwapCopy = 1, kSwapBypassCopy = 2, kSwapFinish = 4;
+
+// the state a Swap copy or bypass changes, which the finish puts back (Forza Motorsport 0x3BC690, 0x3BC720)
+struct SwapSaved {
+    bool valid = false;
+    uint32_t rt = 0, zs = 0;
+    gpu::Viewport viewport;
+    std::array<uint32_t, 4> textures{};
+};
+SwapSaved g_swap_saved;
+
+// Swap's copy: the part of the back buffer SetBackBufferScale left drawn, the front buffer's size times its factors,
+// filtered into the front buffer (Forza Motorsport 0x3BC790 draws it with texture coordinates up to those products)
+void FilterBackBuffer(uint32_t front) {
+    if (!g_backend) return;
+    uint32_t back = Dev(kDevBackBuffer), fw, fh, bw, bh;
+    gpu::SurfaceSize(SurfaceOf(front), fw, fh);
+    gpu::SurfaceSize(SurfaceOf(back), bw, bh);
+    uint32_t w = std::min(uint32_t(fw * double(g_scale_x) + 0.5), bw);
+    uint32_t h = std::min(uint32_t(fh * double(g_scale_y) + 0.5), bh);
+    g_backend->Filter(SurfaceOf(back), SurfaceOf(front), w, h);
+}
+
+// A multisampled device's Swap, as the library's (Forza Motorsport 0x3BCC50, 0x3BC910). A copy or a bypass saves the
+// render target, depth buffer, viewport and textures, turns to the next front buffer (with two, they trade memory so
+// the one off screen is drawn into), makes it the render target and binds the back buffer to stage 0, stages 1 to 3
+// empty. The copy filters the back buffer into the front buffer; a bypass leaves them to the title, which filters the
+// back buffer itself. Either counts a frame. The finish puts the saved state back, so titles that bypass draw the next
+// frame to the back buffer again. Returns the flags.
+uint32_t SwapMultisampled(X86Context& ctx, uint32_t flags) {
+    if (!flags) flags = kSwapCopy | kSwapFinish;
+    if (!(flags & (kSwapCopy | kSwapBypassCopy))) return flags;
+    if (!g_swap_saved.valid) {
+        g_swap_saved = {true, Dev(kDevRenderTarget), Dev(kDevDepth), g_viewport, {}};
+        AddRef(ctx, g_swap_saved.rt);
+        AddRef(ctx, g_swap_saved.zs);
+        for (uint32_t i = 0; i < 4; i++) {
+            g_swap_saved.textures[i] = Dev(kDevTextures + i * 4);
+            AddRef(ctx, g_swap_saved.textures[i]);
+        }
+    }
+    uint32_t front = Dev(kDevFrontBuffer);
+    if (g_aa_fronts == 2) {
+        uint32_t other = Dev(kDevFrontBuffer + 4);
+        for (uint32_t off : {4u, 8u}) {  // data and lock
+            uint32_t v = R32(front + off);
+            W32(front + off, R32(other + off));
+            W32(other + off, v);
+        }
+    }
+    if (flags & kSwapCopy) {
+        FilterBackBuffer(front);
+    } else {
+        ApplyRenderTarget(ctx, front, 0);
+        SetWholeViewport();
+        SetTextureStage(ctx, 0, Dev(kDevBackBuffer));
+        for (uint32_t i = 1; i < 4; i++) SetTextureStage(ctx, i, 0);
+    }
+    SetDev(kDevSwapCount, Dev(kDevSwapCount) + 1);
+    return flags;
+}
+
+// the finish puts back what the copy or bypass saved
+void RestoreAfterSwap(X86Context& ctx) {
+    if (!g_swap_saved.valid) return;
+    SwapSaved saved = g_swap_saved;
+    g_swap_saved.valid = false;
+    ApplyRenderTarget(ctx, saved.rt, saved.zs);
+    g_viewport = saved.viewport;
+    UpdateViewportConstants();
+    for (uint32_t i = 0; i < 4; i++) SetTextureStage(ctx, i, saved.textures[i]);
+    Release(ctx, saved.rt);
+    Release(ctx, saved.zs);
+    for (uint32_t t : saved.textures) Release(ctx, t);
+}
 }  // namespace
 
 HLE_STDCALL(D3DDevice_Swap, 1) {
@@ -587,6 +990,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         app::FinishHandover();
     }
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_aa && !(SwapMultisampled(ctx, a[0]) & kSwapFinish)) return Dev(kDevSwapCount);
     g_presents++;
     // the kept display is shown until the title presents its own
     kernel::SetSavedDataAddress(0);
@@ -595,12 +999,44 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         uint32_t i = Dev(kDevSwapCount) & 1;
         if (Dev(XDK_CDevice_GammaPending + i * 4) == 1) {
             SetDev(XDK_CDevice_GammaPending + i * 4, 0);
-            g_backend->SetGamma(static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300)));
+            const uint8_t* ramp = static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300));
+            LogGammaRamp(ramp, "inlined, at Swap");
+            g_backend->SetGamma(ramp);
         }
     }
     Walk(Dev(kDevPush));  // reports asked for at the end of the frame
-    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
-    app::Pace();
+    // a plain device with a back buffer scale other than 1 copies as a multisampled one does: the part drawn is
+    // filtered into the front buffer, which is shown, and the back buffer stays where it is
+    bool scaled = !g_aa && (g_scale_x != 1 || g_scale_y != 1);
+    if (scaled) FilterBackBuffer(g_buffers[0]);
+    if (g_backend) g_backend->Present(SurfaceOf(g_aa ? Dev(kDevFrontBuffer) : g_buffers[scaled ? 0 : 1]));
+    // D3DRS_PRESENTATIONINTERVAL: the vertical blanks a frame stays up, 0x80000000 set for "or immediately when late"
+    uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4) & 0xFF;
+    app::Pace(interval);
+    if (diag::Perf() && kVBlank) {
+        // the vertical blanks the title sees between two swaps: a title that times its frames by them (the library's
+        // count is what the game reads) wants one or two every time, whatever the host's display does
+        using clock = std::chrono::steady_clock;
+        static uint32_t last = 0, hist[5] = {};
+        static clock::time_point report = clock::now();
+        uint32_t count = Dev(XDK_CDevice_VBlankCount);
+        if (last) hist[std::min<uint32_t>(count - last, 4)]++;
+        last = count;
+        if (clock::now() - report >= std::chrono::seconds(1)) {
+            report = clock::now();
+            LOGI("perf: vertical blanks between swaps: 0 x%u, 1 x%u, 2 x%u, 3 x%u, 4+ x%u", hist[0], hist[1], hist[2],
+                 hist[3], hist[4]);
+            std::fill(std::begin(hist), std::end(hist), 0);
+        }
+    }
+    if (g_aa) {
+        RestoreAfterSwap(ctx);
+        return Dev(kDevSwapCount);
+    }
+    if (scaled) {
+        SetDev(kDevSwapCount, Dev(kDevSwapCount) + 1);
+        return Dev(kDevSwapCount);
+    }
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
     uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
     for (uint32_t i = g_buffer_count - 1; i > 0; i--) {
@@ -618,6 +1054,14 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
 HLE_STDCALL(D3DDevice_Clear, 6) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
+    // the rects on the grid, as the library scales them (Forza Motorsport 0x3BE210)
+    std::vector<int32_t> scaled;
+    if (rects && (g_ss_x != 1 || g_ss_y != 1)) {
+        scaled.resize(size_t(a[0]) * 4);
+        for (size_t i = 0; i < scaled.size(); i++)
+            scaled[i] = Grid(int32_t(R32(a[1] + uint32_t(i) * 4)), i & 1 ? g_ss_y : g_ss_x);
+        rects = reinterpret_cast<const uint8_t*>(scaled.data());
+    }
     if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
     return 0;
 }
@@ -627,7 +1071,7 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
 HLE_STDCALL(D3DDevice_Reset, 1) {
     constexpr uint32_t kClearTargetAndZ = 3;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    ApplyRenderTarget(ctx, g_buffers[1], g_depth);
+    ApplyRenderTarget(ctx, BackBuffer(), g_depth);
     SetFrameBuffers("Reset", a[0]);
     if (g_backend) g_backend->Clear(g_state, 0, nullptr, kClearTargetAndZ, 0, 1.0f, 0);
     return 0;
@@ -642,16 +1086,46 @@ HLE_STDCALL(D3DDevice_CopyRects, 5) {
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
-    g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
     g_state.scissor_count = 0;
-    UpdateViewportConstants();
+    if (v) {
+        SetTitleViewport(R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20));
+    } else {  // no viewport: the whole render target, depth 0 to 1
+        SetWholeViewport();
+    }
     return 0;
 }
 
+// (near, far, flags): the planes depth is clipped at, in depth buffer units, for vertex programs
+// (D3DSDCP_SET_VERTEXPROGRAM_PLANES, 1) or fixed function (D3DSDCP_SET_FIXEDFUNCTION_PLANES, 2); 3 and 4 go back to
+// the defaults (D3DSDCP_USE_DEFAULT_*). The library pushes them as the GPU's clip range on the next viewport update.
+HLE_STDCALL(D3DDevice_SetDepthClipPlanes, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    float near_plane = ArgF(a, 0), far_plane = ArgF(a, 1);
+    switch (a[2]) {
+        case 1:
+            g_state.zplanes[2] = near_plane;
+            g_state.zplanes[3] = far_plane;
+            g_state.zplanes_set |= 2;
+            break;
+        case 2:
+            g_state.zplanes[0] = near_plane;
+            g_state.zplanes[1] = far_plane;
+            g_state.zplanes_set |= 1;
+            break;
+        case 3: g_state.zplanes_set &= ~2u; break;
+        case 4: g_state.zplanes_set &= ~1u; break;
+        default: return 0x8876086Cu;  // D3DERR_INVALIDCALL
+    }
+    LOG_FIRST(8, "d3d: SetDepthClipPlanes %g %g, flags %u", double(near_plane), double(far_plane), a[2]);
+    return 0;
+}
+
+// (count, exclusive, rects): D3DRECTs in the title's coordinates, put on the grid
 HLE_STDCALL(D3DDevice_SetScissors, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.scissor_count = std::min<uint32_t>(a[0], 8);
-    for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(a[2] + i * 4);
+    for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_scissors[i] = int32_t(R32(a[2] + i * 4));
+    UpdateScissors();
     return 0;
 }
 
@@ -676,6 +1150,9 @@ HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
         uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
         g_state.simple[method >> 2] = v;
         W32(kRenderState + rs * 4, v);  // titles read their states back from the library's table
+    } else if (rs == gpu::kRsMultiSampleMode || rs == gpu::kRsMultiSampleRenderTargetMode) {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        SetMultiSampleMode(rs, v);
     } else if (rs < gpu::kRsMax) {
         SetComplex(rs, v);
     }
@@ -704,8 +1181,6 @@ COMPLEX_STATE(LogicOp, gpu::kRsLogicOp)
 COMPLEX_STATE(EdgeAntiAlias, gpu::kRsEdgeAntiAlias)
 COMPLEX_STATE(MultiSampleAntiAlias, gpu::kRsMultiSampleAntiAlias)
 COMPLEX_STATE(MultiSampleMask, gpu::kRsMultiSampleMask)
-COMPLEX_STATE(MultiSampleMode, gpu::kRsMultiSampleMode)
-COMPLEX_STATE(MultiSampleRenderTargetMode, gpu::kRsMultiSampleRenderTargetMode)
 COMPLEX_STATE(ShadowFunc, gpu::kRsShadowFunc)
 COMPLEX_STATE(LineWidth, gpu::kRsLineWidth)
 COMPLEX_STATE(SampleAlpha, gpu::kRsSampleAlpha)
@@ -716,6 +1191,47 @@ COMPLEX_STATE(StencilCullEnable, gpu::kRsStencilCullEnable)
 COMPLEX_STATE(RopZCmpAlwaysRead, gpu::kRsRopZCmpAlwaysRead)
 COMPLEX_STATE(RopZRead, gpu::kRsRopZRead)
 COMPLEX_STATE(DoNotCullUncompressed, gpu::kRsDoNotCullUncompressed)
+
+HLE_STDCALL(D3DDevice_SetRenderState_MultiSampleMode, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    SetMultiSampleMode(gpu::kRsMultiSampleMode, a[0]);
+    return 0;
+}
+HLE_STDCALL(D3DDevice_SetRenderState_MultiSampleRenderTargetMode, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    SetMultiSampleMode(gpu::kRsMultiSampleRenderTargetMode, a[0]);
+    return 0;
+}
+
+// (x, y): the part of the back buffer drawn, as fractions of the front buffers' size (Forza Motorsport 0x3BCD40). It
+// is kept times the samples a pixel, which Swap's copy reads back to filter only that part into the front buffer. The
+// device flag that makes Swap copy is set unless the products come to 1 with back and front buffers alike, and left
+// alone for D3DSWAPEFFECT_COPY, which always copies.
+HLE_STDCALL(D3DDevice_SetBackBufferScale, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    float fx = ArgF(a, 0), fy = ArgF(a, 1);
+    if (diag::BackBufferScale(fx, fy))
+        LOG_FIRST(1, "d3d: back buffer scale %g, %g in place of the title's (XBE_BACKBUFFER_SCALE)", fx, fy);
+    float x = fx * float(g_aa_x), y = fy * float(g_aa_y);
+    uint32_t effect = XDK_CDevice_SwapEffect != xdk::kUnknown ? Dev(XDK_CDevice_SwapEffect) : 0;
+    if (XDK_CDevice_Flags != xdk::kUnknown && effect != 3) {
+        uint32_t back = Dev(kDevBackBuffer), front = Dev(kDevFrontBuffer);
+        bool alike = R32(back + 16) == R32(front + 16) && R32(back + 12) == R32(front + 12);  // size and format
+        if (x != 1 || y != 1) SetDev(XDK_CDevice_Flags, Dev(XDK_CDevice_Flags) | 0x4000);
+        else if (alike) SetDev(XDK_CDevice_Flags, Dev(XDK_CDevice_Flags) & ~0x4000u);
+    }
+    g_scale_x = x;
+    g_scale_y = y;
+    if (XDK_CDevice_BackBufferScale != xdk::kUnknown) {
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale), &x, 4);
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale + 4), &y, 4);
+    }
+    UpdateSurface();
+    ReapplyViewport();
+    LOG_FIRST(8, "d3d: SetBackBufferScale %g, %g: drawn %ux%u on the grid, scaled by %g, %g, %u by %u samples", fx, fy,
+              g_grid_w, g_grid_h, g_ss_x, g_ss_y, g_state.aa_x, g_state.aa_y);
+    return 0;
+}
 
 HLE_STDCALL(D3DDevice_SetTextureState_TexCoordIndex, 2) {
     g_state.tss[a[0] & 3][gpu::kTssTexCoordIndex] = a[1];
@@ -779,13 +1295,7 @@ HLE_WRAP(D3DDevice_LightEnable, 2) {
 
 HLE_STDCALL(D3DDevice_SetTexture, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t stage = a[0] & 3, tex = a[1];
-    uint32_t old = Dev(kDevTextures + stage * 4);
-    AddRef(ctx, tex);
-    SetDev(kDevTextures + stage * 4, tex);
-    Release(ctx, old);
-    g_state.textures[stage] = tex;
-    W32(kDirtyFlags, R32(kDirtyFlags) | XDK_DirtyFlags_Texture);
+    SetTextureStage(ctx, a[0] & 3, a[1]);
     return 0;
 }
 
@@ -1341,8 +1851,15 @@ bool ApplyConstant(uint32_t m, uint32_t v) {
     return true;
 }
 
+// the stipple pattern, which D3DDevice_SetStipple pushes itself (Forza Motorsport's 0x3BA500); false for any other method
+bool ApplyStipple(uint32_t m, uint32_t v) {
+    if (m < gpu::kMStipplePattern || m >= gpu::kMStipplePattern + 32 * 4) return false;
+    g_state.simple[m >> 2] = v;
+    return true;
+}
+
 // reads the commands pushed since the last call: vertex data between a begin and an end is drawn, visibility tests
-// are run, constants are stored, the rest is skipped
+// are run, constants and the stipple pattern are stored, the rest is skipped
 void Walk(uint32_t end) {
     if (!g_walk || end < g_walk || end > g_scratch_push + g_scratch_size) return;
     for (uint32_t p = g_walk; p + 4 <= end;) {
@@ -1354,7 +1871,7 @@ void Walk(uint32_t end) {
             uint32_t m = head & 0x40000000 ? method : method + i * 4;
             uint32_t v = R32(p);
             ApplyVisibilityMethod(m, v);
-            if (!ApplyConstant(m, v)) ApplyImmediate(m, v);
+            if (!ApplyConstant(m, v) && !ApplyStipple(m, v)) ApplyImmediate(m, v);
         }
     }
     g_walk = end;
@@ -1460,7 +1977,7 @@ HLE_STDCALL(D3DDevice_GetTile, 2) {
     uint32_t tile = a[1];
     std::memset(HostPtr(tile), 0, kTileBytes);
     uint32_t surface = 0;
-    if (a[0] == kBackBufferTile) surface = g_buffers[1];
+    if (a[0] == kBackBufferTile) surface = BackBuffer();
     if (a[0] == kDepthTile) surface = g_depth;
     if (!surface) return 0;
     uint32_t size = R32(surface + kSurfaceSize);

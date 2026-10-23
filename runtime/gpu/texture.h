@@ -44,6 +44,11 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
 uint32_t LinearColorFormat(uint32_t fmt);
 uint32_t LinearDepthFormat(uint32_t fmt);
 void SurfaceSize(const Surface& s, uint32_t& w, uint32_t& h);
+// the samples a pixel of the surface whose data is at data_va: State's aa_x and aa_y for the render target or its
+// depth buffer, else 1
+void SurfaceSamples(const State& st, uint32_t data_va, uint32_t& x, uint32_t& y);
+// the grid the console draws to a surface on: its size, divided by its samples
+void RasterSize(const State& st, const Surface& s, uint32_t& w, uint32_t& h);
 
 // CopyRects done in guest memory, false when the formats do not allow it
 bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, uint32_t rects, uint32_t points);

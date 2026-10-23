@@ -2,17 +2,22 @@
 // state starts with a header, then its input and output buffer addresses and its gains. The GP DSP runs the effects
 // in image order on 32 sample frames; a mix bin b is X memory 0x1400 + b * 0x20 to read and 0xC00 + b * 0x20 to
 // write, the same storage. Effects are recognised by their decrypted code, the same in every 5849 image seen (HL2,
-// Double Agent, Black, 007): gain, mixer, filter, I3DL2 reverb and crosstalk are reproduced, others (the sample rate
-// converters that feed DMA outputs) are left out and logged.
+// Double Agent, Black, 007, Forza Motorsport): gain, mixer, filter, I3DL2 reverb, crosstalk and level meter are
+// reproduced, others (the sample rate converters that feed DMA outputs, a capture to memory) are left out and logged.
+// Every reverb in an image runs on its own, with the parameters SetI3DL2Listener (the reverb the image's location
+// names) or XAudioSetEffectData (any reverb by its index) gave it.
 #include "xdk/dsp_image.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 
+#include "core/diag.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 
@@ -28,7 +33,6 @@ using Buffer = std::array<float, kFrame>;
 constexpr uint32_t kBinRead = 0x1400;
 constexpr uint32_t kBinWrite = 0xC00;
 constexpr uint32_t kBinStride = 0x20;
-constexpr uint32_t kSpeakers = 6;
 
 // effect descriptor entry: {code, code bytes, state, state bytes, Y, Y bytes, scratch, scratch bytes}
 constexpr size_t kEntryBytes = 32;
@@ -75,7 +79,7 @@ void Decrypt(const uint8_t* key, uint8_t* data, size_t n) {
     }
 }
 
-enum class Kind { None, Gain, Mixer, Filter, Reverb, Crosstalk };
+enum class Kind { None, Gain, Mixer, Filter, Reverb, Crosstalk, Meter, Capture };
 
 // FNV-1a of the decrypted code with word 1, the effect's state address, left out
 uint64_t CodeHash(const std::vector<uint8_t>& code) {
@@ -94,12 +98,16 @@ Kind KindOf(uint64_t hash) {
         case 0xA8ACC4A41FE77751ull: return Kind::Filter;     // 48 words
         case 0x13CF05D0E014E22Eull: return Kind::Reverb;     // 1211 words
         case 0xF1E0A321578CFED9ull: return Kind::Crosstalk;  // 116 words
+        case 0x1E780021FE8210C1ull: return Kind::Meter;      // 39 words
+        case 0x205DF40F9FE0159Bull: return Kind::Capture;    // 124 words
         default: return Kind::None;
     }
 }
 
 // a 24 bit fraction
 float Frac(uint32_t word) { return float(int32_t(word << 8)) / 2147483648.0f; }
+// and back, for a value from 0 to 1
+uint32_t ToFrac(float x) { return uint32_t(std::lround(std::clamp(x, 0.0f, 1.0f) * 8388607.0f)); }
 // the DSP's limiter on a write to memory
 float Limit(float x) { return std::clamp(x, -1.0f, 1.0f); }
 
@@ -130,6 +138,9 @@ struct Reverb {
     bool on = false, pending = false;
     float fade = 1, held[4] = {};
     uint32_t tick = 0;
+    float peak = 0;        // the largest output since the last report
+    double squares = 0;    // and its outputs squared
+    uint64_t outputs = 0;
 
     Reverb() {
         for (int i = 0; i < 14; i++) line[i].s.assign(kLen[i], 0.0f);
@@ -239,7 +250,12 @@ struct Reverb {
                 }
                 float o[4];
                 Frame(x, o);
-                for (int k = 0; k < 4; k++) held[k] = o[k] * fade;
+                for (int k = 0; k < 4; k++) {
+                    held[k] = o[k] * fade;
+                    peak = std::max(peak, std::fabs(held[k]));
+                    squares += 2.0 * held[k] * held[k];  // added twice
+                    outputs += 2;
+                }
             }
             for (int k = 0; k < 4; k++) (*out[k])[i] = Limit((*out[k])[i] + held[k]);
         }
@@ -297,12 +313,12 @@ struct Effect {
     uint32_t state = 0;  // guest address of its state words
     Crosstalk crosstalk[2];  // its two pairs
     Biquad biquad;
+    std::unique_ptr<Reverb> reverb;  // a reverb's, silent until its parameters are set
 };
 
 std::vector<Effect> g_effects;
 std::map<uint32_t, Buffer> g_x;  // X memory buffers by address, as the effects name them
-Reverb g_reverb;                 // the image's I3DL2 reverb, driven by SetI3DL2Listener
-int32_t g_reverb_index = -1;
+int32_t g_reverb_index = -1;     // the reverb SetI3DL2Listener drives, from DSEFFECTIMAGELOC
 
 uint32_t Word(const Effect& e, uint32_t i) { return R32(e.state + i * 4) & 0xFFFFFF; }
 
@@ -362,9 +378,31 @@ void RunFilter(Effect& e, uint32_t n) {
 
 // input pointer 0 (the second is never read), outputs front left, front right, back left, back right
 void RunReverb(const Effect& e, uint32_t n) {
+    if (!e.reverb || diag::NoReverb()) return;
     Buffer* out[4];
     for (uint32_t k = 0; k < 4; k++) out[k] = &Pointer(e, 2 + k);
-    g_reverb.Run(Pointer(e, 0), out, n);
+    e.reverb->Run(Pointer(e, 0), out, n);
+}
+
+// The level meter: for each of up to six inputs (word 11 counts them, their pointers from word 5) the program writes
+// the frame's mean absolute value, |x| / 32 summed, to word 12 + k and keeps the largest absolute sample in word
+// 18 + k, which it never clears. A title reads both back with GetEffectData (Forza every frame).
+void RunMeter(const Effect& e, uint32_t n) {
+    constexpr uint32_t kCount = 11;
+    constexpr uint32_t kMeans = 12;
+    constexpr uint32_t kPeaks = 18;
+    constexpr uint32_t kMaxInputs = 6;
+    uint32_t count = std::min(Word(e, kCount), kMaxInputs);
+    for (uint32_t k = 0; k < count; k++) {
+        const Buffer& in = Pointer(e, k);
+        float sum = 0, peak = Frac(Word(e, kPeaks + k));
+        for (uint32_t i = 0; i < n; i++) {
+            sum += std::fabs(in[i]);
+            peak = std::max(peak, std::fabs(in[i]));
+        }
+        W32(e.state + (kMeans + k) * 4, ToFrac(sum / kFrame));
+        W32(e.state + (kPeaks + k) * 4, ToFrac(peak));
+    }
 }
 
 // two pairs: inputs 0, 1 and 2, 3, outputs 4, 5 and 6, 7
@@ -377,15 +415,15 @@ void RunCrosstalk(Effect& e, uint32_t n) {
     }
 }
 
-void RunEffect(Effect& e, uint32_t index, uint32_t n) {
+void RunEffect(Effect& e, uint32_t n) {
     switch (e.kind) {
         case Kind::Gain: RunGain(e, n); break;
         case Kind::Mixer: RunMixer(e, n); break;
         case Kind::Filter: RunFilter(e, n); break;
-        case Kind::Reverb:
-            if (int32_t(index) == g_reverb_index) RunReverb(e, n);
-            break;
+        case Kind::Reverb: RunReverb(e, n); break;
         case Kind::Crosstalk: RunCrosstalk(e, n); break;
+        case Kind::Meter: RunMeter(e, n); break;
+        case Kind::Capture:
         case Kind::None: break;
     }
 }
@@ -397,6 +435,9 @@ const char* KindName(Kind k) {
         case Kind::Filter: return "filter";
         case Kind::Reverb: return "reverb";
         case Kind::Crosstalk: return "crosstalk";
+        case Kind::Meter: return "level meter";
+        // one in six samples of a bin, scaled up, to a 16 bit ring in system memory: nothing the speakers play
+        case Kind::Capture: return "capture to memory, not reproduced";
         case Kind::None: break;
     }
     return "not reproduced";
@@ -408,12 +449,17 @@ uint32_t U32(const std::vector<uint8_t>& img, size_t at) {
     return v;
 }
 
+// the effect at an index when it is an I3DL2 reverb
+Reverb* ReverbAt(int32_t index) {
+    if (index < 0 || uint32_t(index) >= g_effects.size()) return nullptr;
+    return g_effects[uint32_t(index)].reverb.get();
+}
+
 }  // namespace
 
 void Load(const std::vector<uint8_t>& img, size_t table, const std::vector<uint32_t>& states, int32_t reverb) {
     g_effects.clear();
     g_x.clear();
-    g_reverb = Reverb();
     g_reverb_index = reverb;
     uint32_t count = uint32_t(states.size());
     size_t keys_at = table + 8 + count * kEntryBytes;
@@ -433,15 +479,48 @@ void Load(const std::vector<uint8_t>& img, size_t table, const std::vector<uint3
             Decrypt(&keys[i * kKeyBytes], code.data(), code.size());
             e.kind = KindOf(CodeHash(code));
         }
+        if (e.kind == Kind::Reverb) e.reverb = std::make_unique<Reverb>();
         kinds += " " + std::to_string(i) + " " + KindName(e.kind) + ",";
-        g_effects.push_back(e);
+        g_effects.push_back(std::move(e));
     }
     LOGR("dsound: effects image, reverb %d, effects%s", reverb, kinds.c_str());
 }
 
 bool Loaded() { return !g_effects.empty(); }
 
-void SetListener(const float* p) { g_reverb.Set(p); }
+bool SetListener(const float* p) { return SetReverb(g_reverb_index, p); }
+
+bool SetReverb(int32_t effect, const float* p) {
+    Reverb* r = ReverbAt(effect);
+    if (r) r->Set(p);
+    return r;
+}
+
+std::string Report() {
+    std::string s;
+    char item[64];
+    for (uint32_t k = 0; k < g_effects.size(); k++) {
+        Effect& e = g_effects[k];
+        if (e.reverb && e.reverb->on) {
+            Reverb& r = *e.reverb;
+            double rms = r.outputs ? std::sqrt(r.squares / double(r.outputs)) : 0.0;
+            std::snprintf(item, sizeof item, " %u reverb out peak %.3f RMS %.1f dBFS,", k, r.peak,
+                          rms > 0 ? 20 * std::log10(rms) : -120.0);
+            r.peak = 0;
+            r.squares = 0;
+            r.outputs = 0;
+        } else if (e.reverb) {
+            std::snprintf(item, sizeof item, " %u reverb not set,", k);
+        } else if (e.kind == Kind::Mixer) {
+            std::snprintf(item, sizeof item, " %u mixer %.3f %.3f,", k, Frac(Word(e, 8)), Frac(Word(e, 9)));
+        } else {
+            continue;
+        }
+        s += item;
+    }
+    if (!s.empty()) s.pop_back();
+    return s;
+}
 
 void Run(float* bins, uint32_t frames) {
     for (uint32_t start = 0; start < frames; start += kFrame) {
@@ -452,8 +531,8 @@ void Run(float* bins, uint32_t frames) {
             Buffer& bin = At(kBinRead + b * kBinStride);
             for (uint32_t i = 0; i < n; i++) bin[i] = Limit(frame[i * kBins + b]);
         }
-        for (uint32_t k = 0; k < g_effects.size(); k++) RunEffect(g_effects[k], k, n);
-        for (uint32_t b = 0; b < kSpeakers; b++) {
+        for (Effect& e : g_effects) RunEffect(e, n);
+        for (uint32_t b = 0; b < kBins; b++) {
             const Buffer& bin = At(kBinRead + b * kBinStride);
             for (uint32_t i = 0; i < n; i++) frame[i * kBins + b] = bin[i];
         }

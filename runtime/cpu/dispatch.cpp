@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/diag.h"
 #include "core/log.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
@@ -172,6 +173,17 @@ void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
 
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
     if (ordinal < 400 && g_exports[ordinal].fn) {
+        static std::atomic<uint32_t> traced[400];
+        if (unsigned limit = diag::TraceKernel(); limit && traced[ordinal].fetch_add(1) < limit) {
+            uint32_t ret = kernel::R32(ctx.esp), thread = ctx.fs_base;  // fs base tells guest threads apart
+            LOGR("kernel %X: %s(%08X, %08X, %08X, %08X, %08X, %08X, %08X, %08X) from %08X", thread,
+                 kernel::ExportName(ordinal), kernel::R32(ctx.esp + 4), kernel::R32(ctx.esp + 8), kernel::R32(ctx.esp + 12),
+                 kernel::R32(ctx.esp + 16), kernel::R32(ctx.esp + 20), kernel::R32(ctx.esp + 24), kernel::R32(ctx.esp + 28),
+                 kernel::R32(ctx.esp + 32), ret);
+            g_exports[ordinal].fn(ctx, base);
+            LOGR("kernel %X: %s -> %08X", thread, kernel::ExportName(ordinal), ctx.eax);
+            return;
+        }
         g_exports[ordinal].fn(ctx, base);
         return;
     }
