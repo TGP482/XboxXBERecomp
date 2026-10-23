@@ -41,7 +41,12 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t {
+    State, Draw, Clear, Copy, Present, Sync, RecordLate, Fetch, Flush, Gamma, ClearReport, GetReport, Overlay, Filter
+};
+
+// a fetch the title stopped asking about before it was made is not written, in case the memory went to another use
+constexpr uint64_t kFetchBatches = 30;
 
 struct Cmd {
     Op op;
@@ -174,6 +179,18 @@ public:
         g_perf_capture_ns += Ns(t);
     }
 
+    void Filter(const Surface& src, const Surface& dst, uint32_t w, uint32_t h) override {
+        Cmd c{Op::Filter, w, h};
+        c.s1 = src;
+        c.s1.header = Header(src.header);
+        c.s2 = dst;
+        c.s2.header = Header(dst.header);
+        cur_->cmds.push_back(c);
+        Use(src.header);
+        Use(dst.header);
+        Written(dst);
+    }
+
     void Present(const Surface& front) override {
         auto t = Clock::now();
         Cmd c{Op::Present};
@@ -212,6 +229,15 @@ public:
         cur_->cmds.push_back(c);
     }
 
+    void SetOverlay(const Overlay& o) override {
+        Cmd c{Op::Overlay};
+        c.s1 = o.surface;
+        c.s1.header = Header(o.surface.header);
+        c.data = Put(&o, sizeof(o));
+        cur_->cmds.push_back(c);
+        Use(o.surface.header);
+    }
+
     void ClearReport() override { cur_->cmds.push_back(Cmd{Op::ClearReport}); }
     void GetReport(uint32_t report) override {
         Cmd c{Op::GetReport};
@@ -229,6 +255,24 @@ public:
     void WaitResource(uint32_t resource) override {
         auto it = last_use_.find(resource);
         if (it != last_use_.end()) Wait(it->second, WaitFor::Resource, "resource");
+    }
+    bool Fetching(uint32_t data) override {
+        if (auto it = fetching_.find(data); it != fetching_.end()) {
+            uint64_t done = done_.load();
+            if (done < it->second + kFetchBatches) {
+                // the copy is recorded once the render thread is past the batch that asked for it
+                if (it->second > done || !inner_->Fetched(data)) return true;
+                fetching_.erase(it);
+                return false;
+            }
+            fetching_.erase(it);
+        }
+        if (!written_.erase(data)) return false;
+        Cmd c{Op::Fetch};
+        c.a = data;
+        cur_->cmds.push_back(c);
+        fetching_[data] = cur_->id;
+        return true;
     }
 
 private:
@@ -433,13 +477,22 @@ private:
             case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
+            case Op::Filter: inner_->Filter(c.s1, c.s2, c.a, c.b); break;
             case Op::Present: inner_->Present(c.s1); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
+            case Op::Fetch: inner_->StartFetch(c.a); break;
             case Op::Flush: inner_->Flush(); break;
             case Op::Gamma: inner_->SetGamma(data); break;
             case Op::ClearReport: inner_->ClearReport(); break;
             case Op::GetReport: inner_->GetReport(c.a); break;
+            case Op::Overlay: {
+                Overlay o;
+                std::memcpy(&o, data, sizeof(o));
+                o.surface = c.s1;
+                inner_->SetOverlay(o);
+                break;
+            }
         }
     }
 
@@ -467,6 +520,7 @@ private:
     State sent_;  // the state as the render thread will have it
     std::unordered_map<uint32_t, uint64_t> last_use_;
     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
+    std::unordered_map<uint32_t, uint64_t> fetching_;  // IsBusy's fetches on their way: the batch that asked
     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
     uint64_t next_id_ = 0, last_present_ = 0;
 

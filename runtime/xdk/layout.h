@@ -129,6 +129,24 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_CDevice_GammaPending
 #define XDK_CDevice_GammaPending 0xFFFFFFFFu
 #endif
+#ifndef XDK_CDevice_MultiSampleType
+#define XDK_CDevice_MultiSampleType 0xFFFFFFFFu
+#endif
+#ifndef XDK_CDevice_FrameBufferCount
+#define XDK_CDevice_FrameBufferCount 0xFFFFFFFFu
+#endif
+#ifndef XDK_CDevice_SwapEffect
+#define XDK_CDevice_SwapEffect 0xFFFFFFFFu
+#endif
+#ifndef XDK_CDevice_GridSize
+#define XDK_CDevice_GridSize 0xFFFFFFFFu
+#endif
+#ifndef XDK_CDevice_SuperSampleMin
+#define XDK_CDevice_SuperSampleMin 0xFFFFFFFFu
+#endif
+#ifndef XDK_CDevice_SuperSampleLog2
+#define XDK_CDevice_SuperSampleLog2 0xFFFFFFFFu
+#endif
 #ifndef XDK_PixelShader_Definition
 #define XDK_PixelShader_Definition 0xFFFFFFFFu
 #endif

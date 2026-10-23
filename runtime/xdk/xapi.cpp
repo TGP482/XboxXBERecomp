@@ -1,4 +1,5 @@
 // XAPI functions that talk to hardware: controller ports and the hard disk cache partition
+#include <algorithm>
 #include <chrono>
 
 #include "core/input.h"
@@ -41,6 +42,52 @@ struct Handle {
     input::Pad last;
 };
 std::unordered_map<uint32_t, Handle> g_handles;
+
+// verbose: every few seconds, how the title drove each pad's motors since the last report; the mean is each motor's
+// speed averaged over the time, as a share of full
+struct RumbleLog {
+    uint32_t calls = 0, changes = 0;
+    uint16_t left = 0, right = 0, left_max = 0, right_max = 0;
+    double left_area = 0, right_area = 0;  // speed times seconds
+    std::chrono::steady_clock::time_point since{};  // the area's end
+};
+RumbleLog g_rumble[4];
+
+void AddRumbleArea(RumbleLog& r, std::chrono::steady_clock::time_point now) {
+    if (r.since != std::chrono::steady_clock::time_point{}) {
+        double s = std::chrono::duration<double>(now - r.since).count();
+        r.left_area += r.left * s;
+        r.right_area += r.right * s;
+    }
+    r.since = now;
+}
+
+void LogRumble(uint32_t port, uint16_t left, uint16_t right) {
+    static auto start = std::chrono::steady_clock::now();
+    static auto next = start;
+    auto now = std::chrono::steady_clock::now();
+    RumbleLog& r = g_rumble[port];
+    AddRumbleArea(r, now);
+    r.calls++;
+    if (left != r.left || right != r.right) r.changes++;
+    r.left = left;
+    r.right = right;
+    r.left_max = std::max(r.left_max, left);
+    r.right_max = std::max(r.right_max, right);
+    if (now < next) return;
+    next = now + std::chrono::seconds(3);
+    double window = std::max(std::chrono::duration<double>(now - start).count(), 1e-3);
+    start = now;
+    for (uint32_t p = 0; p < 4; p++) {
+        RumbleLog& l = g_rumble[p];
+        AddRumbleArea(l, now);
+        if (l.calls)
+            LOGI("xapi: rumble port %u: %u sets, %u changes, left (low) up to %u mean %.1f%%, right (high) up to %u mean "
+             "%.1f%%, now %u %u", p, l.calls, l.changes, l.left_max, l.left_area / window / 655.35, l.right_max,
+             l.right_area / window / 655.35, l.left, l.right);
+        l = {0, 0, l.left, l.right, 0, 0, 0, 0, now};
+    }
+}
 
 }  // namespace
 
@@ -143,8 +190,14 @@ HLE_STDCALL(XInputSetState, 2) {
         port = it->second.port;
     }
     uint32_t fb = a[1];
-    // XINPUT_FEEDBACK_HEADER is dwStatus, hEvent and 58 reserved bytes, the rumble follows
-    input::Rumble(int(port), R16(fb + 66), R16(fb + 68));
+    // XINPUT_FEEDBACK_HEADER is dwStatus, hEvent and 58 reserved bytes, the rumble follows: the left (low frequency)
+    // motor's speed, then the right (high frequency) motor's
+    uint16_t left = R16(fb + 66), right = R16(fb + 68);
+    {
+        std::lock_guard<std::mutex> lock(g_ports_lock);
+        LogRumble(port, left, right);
+    }
+    input::Rumble(int(port), left, right);
     W32(fb, 0);
     if (uint32_t ev = R32(fb + 4))
         if (ObjectRef o = FromHandle(ev)) SetEvent(*o);

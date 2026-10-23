@@ -330,7 +330,18 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
     if (f.compressed) {
         uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
         row_pitch = bw * f.bits;
-        out.assign(src, src + size_t(row_pitch) * bh * z);
+        if (z == 1) {
+            out.assign(src, src + size_t(row_pitch) * bh);
+            return;
+        }
+        // a compressed volume keeps the slices of one block position side by side: block (x, y)'s slice k is
+        // block number (y * blocks across + x) * depth + k, so every slice is every depth-th block
+        out.resize(size_t(row_pitch) * bh * z);
+        for (uint32_t k = 0; k < z; k++)
+            for (uint32_t y = 0; y < bh; y++)
+                for (uint32_t x = 0; x < bw; x++)
+                    std::memcpy(&out[(size_t(k) * bh + y) * row_pitch + size_t(x) * f.bits],
+                                src + (size_t(y) * bw + x) * z * f.bits + size_t(k) * f.bits, f.bits);
         return;
     }
     if (f.host == Host::R32F) {
@@ -423,6 +434,22 @@ void SurfaceSize(const Surface& s, uint32_t& w, uint32_t& h) {
         w = 640;
         h = 480;
     }
+}
+
+void SurfaceSamples(const State& st, uint32_t data_va, uint32_t& x, uint32_t& y) {
+    bool aa = data_va && st.aa_x * st.aa_y > 1 &&
+              ((st.rt.header && data_va == mem::VirtualFromPhysical(st.rt.data)) ||
+               (st.zs.header && data_va == mem::VirtualFromPhysical(st.zs.data)));
+    x = aa ? st.aa_x : 1;
+    y = aa ? st.aa_y : 1;
+}
+
+void RasterSize(const State& st, const Surface& s, uint32_t& w, uint32_t& h) {
+    SurfaceSize(s, w, h);
+    uint32_t sx, sy;
+    SurfaceSamples(st, s.header ? mem::VirtualFromPhysical(s.data) : 0, sx, sy);
+    w = std::max(w / sx, 1u);
+    h = std::max(h / sy, 1u);
 }
 
 void MarkDirty(uint32_t res) {
