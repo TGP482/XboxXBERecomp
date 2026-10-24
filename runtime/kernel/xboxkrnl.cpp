@@ -8,6 +8,7 @@
 #include "kernel/crypto.h"
 #include "kernel/exports.h"
 #include "xbe/xbe.h"
+#include "image_symbols.h"
 
 namespace kernel {
 
@@ -363,8 +364,17 @@ KERNEL_EXPORT(217, NtQueryVirtualMemory, 2) {
     return kSuccess;
 }
 
-KERNEL_EXPORT(165, MmAllocateContiguousMemory, 1) { return mem::AllocContiguous(a[0], 0, 0xFFFFFFFF, 0); }
-KERNEL_EXPORT(166, MmAllocateContiguousMemoryEx, 5) { return mem::AllocContiguous(a[0], a[1], a[2], a[3]); }
+// a library that takes physical addresses with a retail console's 64 MB mask (XDK 4134's D3DResource_Register and
+// texture creation) needs the title's contiguous memory below it; the host's own buffers may still go higher
+#ifdef XDK_ContiguousLimit
+constexpr uint32_t kGuestHighest = XDK_ContiguousLimit - 1;
+#else
+constexpr uint32_t kGuestHighest = 0xFFFFFFFF;
+#endif
+KERNEL_EXPORT(165, MmAllocateContiguousMemory, 1) { return mem::AllocContiguous(a[0], 0, kGuestHighest, 0); }
+KERNEL_EXPORT(166, MmAllocateContiguousMemoryEx, 5) {
+    return mem::AllocContiguous(a[0], a[1], std::min(a[2], kGuestHighest), a[3]);
+}
 KERNEL_EXPORT(171, MmFreeContiguousMemory, 1) {
     mem::FreeContiguous(a[0]);
     return 0;
@@ -986,8 +996,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
     return n;
 }
 
-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
-    switch (a[0]) {
+static uint32_t NtStatusToDosError(uint32_t status) {
+    switch (status) {
         case kSuccess: return 0;
         case kPending: return 997;
         case kTimeout: return 1460;
@@ -1010,8 +1020,19 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
         case kNotADirectory: return 267;
         case 0xC000007F: return 112;  // disk full
         case kDeviceNotConnected: return 1167;
-        default: return (a[0] & 0xC0000000) ? 317 : 0;
+        default: return (status & 0xC0000000) ? 317 : 0;
     }
+}
+
+KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return NtStatusToDosError(a[0]); }
+
+// (ApcContext, IoStatusBlock, reserved): the APC XAPI's ReadFileEx and WriteFileEx queue; the context is the
+// title's completion routine, the status block is the start of its OVERLAPPED
+KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
+    uint32_t routine = a[0], iosb = a[1], status = R32(iosb);
+    uint32_t error = (status & 0x80000000u) ? NtStatusToDosError(status) : 0;
+    CallGuest(ctx, routine, {error, R32(iosb + 4), iosb});
+    return 0;
 }
 
 // exceptions, debug, shutdown

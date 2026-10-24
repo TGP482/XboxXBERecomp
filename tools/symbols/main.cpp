@@ -858,7 +858,9 @@ void SignData(const Title& t, const std::set<std::string>& skip, const std::map<
     std::map<std::string, uint32_t> anchor_at;
     // the first candidate whose code finds dva sets the data's recipe
     auto sign = [&](const std::string& dn, uint32_t dva, decltype(&FindRef) find) {
-        for (auto& [n, va] : DataCandidates(t, fresh, sf, dn)) {
+        for (auto& [cn, va] : DataCandidates(t, fresh, sf, dn)) {
+            // an unnamed extra entry point anchors under the data's name
+            const std::string n = cn.empty() ? dn + "_ref" : cn;
             bool is_sym = fresh.count(n) && fresh.at(n) == va;
             if (!is_sym && sf.names.count(n)) continue;
             uint32_t len = is_sym ? sf.symbols[n].len : MakeSig(t, va).len;
