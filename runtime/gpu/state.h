@@ -185,6 +185,11 @@ struct State {
     uint32_t light_enable = 0;                         // bit per light
     float ss_offset_x = 0, ss_offset_y = 0;
     float zscale = 16777215.0f;  // depth buffer units per 1.0
+    // The device's SuperSampleScale: render target pixels per pixel of the title's frame. A supersampling multisample
+    // type (D3DMULTISAMPLE_*_SUPERSAMPLE_*) renders the back buffer this many times larger and filters it down at present,
+    // so a vertex program's screen space positions are in those pixels while the title's surfaces, viewport, scissors
+    // and rects stay in the frame's. 1 for any other render target or multisample type.
+    float super_x = 1, super_y = 1;
 };
 
 }  // namespace gpu

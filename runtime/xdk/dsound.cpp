@@ -85,6 +85,10 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundBuffer_SetEG FFFFFF0E
 #define HAS_IDirectSoundBuffer_SetEG 0
 #endif
+#ifndef SYM_IDirectSoundBuffer_PlayEx
+#define SYM_IDirectSoundBuffer_PlayEx FFFFFF0F
+#define HAS_IDirectSoundBuffer_PlayEx 0
+#endif
 
 namespace {
 
@@ -742,7 +746,7 @@ static void AuditExports() {
         SYM(IDirectSoundBuffer_StopEx), SYM(IDirectSoundBuffer_Pause), SYM(IDirectSoundBuffer_SetEG),
         SYM(XAudioDownloadEffectsImage), SYM(DirectSoundCreateBuffer), SYM(IDirectSound_CreateSoundBuffer),
         SYM(IDirectSoundBuffer_Release), SYM(IDirectSoundBuffer_Unlock), SYM(IDirectSoundBuffer_SetBufferData),
-        SYM(IDirectSoundBuffer_Play), SYM(IDirectSoundBuffer_Stop), SYM(IDirectSoundBuffer_SetLoopRegion),
+        SYM(IDirectSoundBuffer_Play), SYM(IDirectSoundBuffer_PlayEx), SYM(IDirectSoundBuffer_Stop), SYM(IDirectSoundBuffer_SetLoopRegion),
         SYM(IDirectSoundBuffer_GetStatus), SYM(IDirectSoundBuffer_GetCurrentPosition), SYM(IDirectSoundBuffer_SetCurrentPosition),
         SYM(IDirectSoundBuffer_Lock), SYM(IDirectSoundBuffer_SetVolume), SYM(IDirectSoundBuffer_SetFrequency),
         SYM(IDirectSoundBuffer_SetFilter), SYM(IDirectSoundBuffer_SetHeadroom), SYM(IDirectSoundBuffer_SetMixBinVolumes),
@@ -971,6 +975,17 @@ BUFFER(SetBufferData, 3) {
 }
 BUFFER(Play, 4) {
     v.has_gain = false;  // a new sound does not ramp from the last one's levels
+    v.playing = true;
+    v.looping = a[3] & 1;
+    if (a[3] & 2) v.pos = 0;
+    v.sync = a[3] & 4;
+    return 0;
+}
+// (this, reference time low, reference time high, flags): Play with a scheduled start time. The Sims passes time 0
+// (play now); a future time plays now too, the scheduling offset is not reproduced. Flags share Play's low bits. Its
+// guest body forwards to the buffer's inner object, which a host buffer does not have, so the guest code faults.
+BUFFER(PlayEx, 4) {
+    v.has_gain = false;
     v.playing = true;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;

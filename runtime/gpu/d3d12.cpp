@@ -2016,9 +2016,11 @@ void FillFogConstants(const State& s, bool vertex_program, DrawConstants& c) {
     c.fog[3] = float(s.rs[kRsFogTableMode]);
 }
 
-void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
-    c.surf[0] = float(size.w);
-    c.surf[1] = float(size.h);
+// a vertex program's screen space positions are the render target's pixels, SuperSampleScale of them to each of the
+// frame's on a supersampled back buffer; fixed function and pretransformed positions stay in the frame's
+void FillSurfaceConstants(const State& s, GuestExtent size, bool vertex_program, DrawConstants& c) {
+    c.surf[0] = float(size.w) * (vertex_program ? s.super_x : 1.0f);
+    c.surf[1] = float(size.h) * (vertex_program ? s.super_y : 1.0f);
     c.surf[2] = 1.0f / s.zscale;
     Color(s.rs[kRsFogColor], c.fog_color);
     c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
@@ -2187,7 +2189,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     Alloc vc = Upload(sizeof(s.vsc), 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     Alloc dc = Upload(sizeof(DrawConstants), 256);
-    FillSurfaceConstants(s, size, c);
+    FillSurfaceConstants(s, size, sh.prog, c);
     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
     FillFogConstants(s, sh.prog, c);
@@ -2849,7 +2851,14 @@ void D3D12Backend::BlitFrame(Target& t) {
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
-    float uv[4] = {0, 0, 1, 1};
+    // only the rows the title draws into: uv is origin and size, so a game that renders a shorter
+    // picture inside the console frame has its dead rows left behind instead of shown as bars
+    float v0 = 0.0f, dv = 1.0f;
+    if (app::kGame.picture_height && guest_h_) {
+        v0 = float(app::kGame.picture_top) / float(guest_h_);
+        dv = float(app::kGame.picture_height) / float(guest_h_);
+    }
+    float uv[4] = {0, v0, 1, dv};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
