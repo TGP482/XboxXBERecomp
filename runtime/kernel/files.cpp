@@ -78,6 +78,8 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+    ObjectRef completion_port;       // NtSetInformationFile FileCompletionInformation, null when unassociated
+    uint32_t completion_key = 0;
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
     File() : Object(ObjType::File) {}
     ~File() override {
@@ -459,6 +461,9 @@ static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uin
     IoStatus(iosb, status, n);
     SetEvent(f);
     Complete(event, apc, apc_ctx, iosb);
+    // a file bound to a completion port posts its packet at completion; transfers never pend here, so the packet
+    // is queued synchronously, and an APC routine (which NT forbids beside a port) suppresses the post
+    if (f.completion_port && !apc) PostIoCompletion(f.completion_port, f.completion_key, apc_ctx, status, n);
     return status;
 }
 
@@ -545,10 +550,10 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
 }
 
 KERNEL_EXPORT(226, NtSetInformationFile, 5) {
-    uint32_t h = a[0], iosb = a[1], in = a[2], cls = a[4];
+    uint32_t h = a[0], iosb = a[1], in = a[2], len = a[3], cls = a[4];
     auto f = FileFromHandle(h);
     if (!f) return kInvalidHandle;
-    if (f->entry && cls != 14 && cls != 4) return kAccessDenied;
+    if (f->entry && cls != 14 && cls != 4 && cls != 30) return kAccessDenied;
     std::error_code ec;
     switch (cls) {
         case 14:  // position
@@ -579,6 +584,30 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
         }
         case 4:  // basic, times and attributes are not kept
             break;
+        case 30: {  // FileCompletionInformation: port handle, then the key every packet for this file carries
+            // D8: Finish reads completion_port/completion_key under f->io (held by
+            // Transfer across the whole transfer), so the reset, the assignment and
+            // the key all happen under that same mutex; otherwise a bind/unbind on
+            // one guest thread races a completing transfer on another on the
+            // shared_ptr itself. Lock order matches Transfer: f->io before the
+            // handle-table lock FromHandle takes below.
+            std::lock_guard<std::mutex> lock(f->io);
+            if (len < 8) return kInvalidParameter;
+            uint32_t port_handle = R32(in);
+            if (!port_handle) {
+                f->completion_port.reset();
+                f->completion_key = 0;
+                break;
+            }
+            ObjectRef port = FromHandle(port_handle);
+            if (!port) return kInvalidHandle;
+            // R12: NewIoCompletion is the only constructor of ObjType::Queue, so this tag test and
+            // PostIoCompletion's dynamic type test accept exactly the same objects
+            if (port->type != ObjType::Queue) return kObjectTypeMismatch;
+            f->completion_port = port;
+            f->completion_key = R32(in + 4);
+            break;
+        }
         default:
             LOG_FIRST(8, "NtSetInformationFile: class %u", cls);
             return kInvalidParameter;
@@ -774,6 +803,197 @@ KERNEL_EXPORT(215, NtQuerySymbolicLinkObject, 3) {
     if (t.size() > maxlen) return kBufferTooSmall;
     std::memcpy(HostPtr(R32(str + 4)), t.data(), t.size());
     W16(str, uint16_t(t.size()));
+    return kSuccess;
+}
+
+// the volume behind a file: the mounted disc image, or the host folder standing in for a hard-disk partition
+namespace {
+
+struct Volume {
+    bool optical = false;
+    uint64_t total = 0;
+    uint64_t avail = 0;
+    uint32_t sectors = 1;
+    uint32_t sector_bytes = 2048;
+    uint32_t device = 2;         // FILE_DEVICE_CD_ROM, or FILE_DEVICE_DISK below
+    uint32_t characteristics = 0x22;  // FILE_READ_ONLY_DEVICE | FILE_DEVICE_IS_MOUNTED
+    uint64_t creation = 0;
+    const char* fs_name = "XDVDFS";
+    uint32_t max_component = 64;
+};
+
+Volume VolumeOf(File& f) {
+    Volume v;
+    std::string up = Upper(f.xbox);
+    v.optical = f.entry != nullptr || up.find("CDROM0") != std::string::npos ||
+                (up.size() >= 2 && up[0] == 'D' && up[1] == ':');
+    std::error_code ec;
+    if (v.optical && MountedDisc()) {
+        v.total = fs::file_size(MountedDisc()->Path(), ec);
+        if (ec) v.total = 0;
+        v.avail = 0;
+        v.creation = MountedDisc()->Time();
+    } else {
+        fs::path where = f.host.empty() ? fs::path(".") : fs::path(f.host);
+        fs::space_info space = fs::space(where, ec);
+        if (!ec) {
+            v.total = space.capacity;
+            v.avail = space.available;
+        }
+        v.creation = uint64_t(Now100ns());
+        if (!v.optical) {
+            v.sectors = 32;
+            v.sector_bytes = 512;
+            v.device = 7;  // FILE_DEVICE_DISK
+            v.characteristics = 0x20;  // FILE_DEVICE_IS_MOUNTED
+            v.fs_name = "FATX";
+            v.max_component = 42;
+        }
+    }
+    return v;
+}
+
+bool TypeAllowsFile(uint32_t object_type) {
+    if (!object_type) return true;
+    if (object_type == DataAddress(71) || object_type == DataAddress(240)) return true;  // file or directory
+    const uint32_t other[] = {DataAddress(64), DataAddress(16), DataAddress(30), DataAddress(22),
+                              DataAddress(31), DataAddress(259), DataAddress(249), DataAddress(70)};
+    for (uint32_t known : other)
+        if (known && object_type == known) return false;
+    return true;  // an unrecognised type address is not second-guessed
+}
+
+bool TypeMatches(uint32_t object_type, const ObjectRef& obj) {
+    if (!object_type) return true;
+    ObjType want;
+    if (object_type == DataAddress(71) || object_type == DataAddress(240)) want = ObjType::File;
+    else if (object_type == DataAddress(64)) want = ObjType::Queue;
+    else if (object_type == DataAddress(16)) want = ObjType::Event;
+    else if (object_type == DataAddress(30)) want = ObjType::Semaphore;
+    else if (object_type == DataAddress(22)) want = ObjType::Mutant;
+    else if (object_type == DataAddress(31)) want = ObjType::Timer;
+    else if (object_type == DataAddress(259)) want = ObjType::Thread;
+    else if (object_type == DataAddress(249)) want = ObjType::SymLink;
+    else if (object_type == DataAddress(70)) want = ObjType::Device;
+    else {
+        LOG_FIRST(8, "ObOpenObjectByName: unknown object type %08X", object_type);
+        return true;
+    }
+    return obj->type == want;
+}
+
+}  // namespace
+
+KERNEL_EXPORT(76, IoQueryVolumeInformation, 5) {
+    uint32_t cls = a[1], len = a[2], out = a[3], returned = a[4];
+    if (returned) W32(returned, 0);
+    ObjectRef o = a[0] ? FromPointer(a[0]) : nullptr;
+    if (!o) return kInvalidParameter;
+    if (o->type != ObjType::File) return kObjectTypeMismatch;
+    auto f = std::static_pointer_cast<File>(o);
+    if (!out) return kInvalidParameter;
+    Volume v = VolumeOf(*f);
+    uint64_t unit = uint64_t(v.sectors) * v.sector_bytes;
+    uint64_t total_units = unit ? v.total / unit : 0;
+    uint64_t avail_units = unit ? v.avail / unit : 0;
+    uint32_t serial = uint32_t(total_units) ^ uint32_t(total_units >> 32) ^ uint32_t(v.creation) ^
+                      uint32_t(v.creation >> 32);
+    if (!serial) serial = 1;
+    uint32_t need = 0;
+    switch (cls) {
+        case 1: need = 18; break;   // FileFsVolumeInformation through its empty label
+        case 3: need = 24; break;   // FileFsSizeInformation
+        case 4: need = 8; break;    // FileFsDeviceInformation
+        case 7: need = 32; break;   // FileFsFullSizeInformation
+        case 5: need = 12 + uint32_t(std::strlen(v.fs_name)); break;  // FileFsAttributeInformation
+        default:
+            LOG_FIRST(8, "IoQueryVolumeInformation: class %u", cls);
+            return kInvalidInfoClass;
+    }
+    if (len < need) {
+        if (returned) W32(returned, need);
+        return kBufferTooSmall;
+    }
+    std::memset(HostPtr(out), 0, need);
+    switch (cls) {
+        case 1:
+            W64(out, v.creation);
+            W32(out + 8, serial);
+            break;  // label length and SupportsObjects stay zero
+        case 3:
+            W64(out, total_units);
+            W64(out + 8, avail_units);
+            W32(out + 16, v.sectors);
+            W32(out + 20, v.sector_bytes);
+            break;
+        case 4:
+            W32(out, v.device);
+            W32(out + 4, v.characteristics);
+            break;
+        case 7:
+            W64(out, total_units);
+            W64(out + 8, avail_units);
+            W64(out + 16, avail_units);
+            W32(out + 24, v.sectors);
+            W32(out + 28, v.sector_bytes);
+            break;
+        case 5:
+            W32(out + 4, v.max_component);
+            W32(out + 8, uint32_t(std::strlen(v.fs_name)));
+            std::memcpy(HostPtr(out + 12), v.fs_name, std::strlen(v.fs_name));
+            break;
+    }
+    if (returned) W32(returned, need);
+    return kSuccess;
+}
+
+KERNEL_EXPORT(243, ObOpenObjectByName, 4) {
+    uint32_t attrs = a[0], object_type = a[1], parse_context = a[2], handle_out = a[3];
+    if (!attrs || !handle_out) return kInvalidParameter;
+    W32(handle_out, 0);
+    if (parse_context) LOG_FIRST(8, "ObOpenObjectByName: parse context %08X ignored", parse_context);
+    uint32_t root = R32(attrs);
+    std::string name = ReadAnsiString(R32(attrs + 4));
+    if (name.empty()) {
+        if (!root) return kObjectNameInvalid;
+        ObjectRef self = FromHandle(root);
+        if (!self) return kInvalidHandle;
+        if (!TypeMatches(object_type, self)) return kObjectTypeMismatch;
+        W32(handle_out, NewHandle(self));
+        return kSuccess;
+    }
+    if (ObjectRef named = FindNamed(name)) {
+        if (!TypeMatches(object_type, named)) return kObjectTypeMismatch;
+        W32(handle_out, NewHandle(named));
+        return kSuccess;
+    }
+    if (std::string target = QuerySymbolicLink(name); !target.empty()) {
+        auto link = std::make_shared<Link>();
+        link->target = target;
+        if (!TypeMatches(object_type, link)) return kObjectTypeMismatch;
+        W32(handle_out, NewHandle(link));
+        return kSuccess;
+    }
+    if (!TypeAllowsFile(object_type)) return kObjectTypeMismatch;
+    Target t = Resolve(name, root);
+    if (t.disc) return OpenOnDisc(t.entry, name, handle_out, 0, 1, 0);
+    const std::string& host = t.host;
+    if (host.empty()) return kObjectPathNotFound;
+    std::error_code ec;
+    if (!fs::exists(host, ec)) {
+        LOG_FIRST(200, "missing %s", name.c_str());
+        return kObjectNameNotFound;
+    }
+    auto f = std::make_shared<File>();
+    f->host = host;
+    f->xbox = Normalize(name);
+    f->dir = fs::is_directory(host, ec);
+    if (!f->dir) {
+        f->fp = std::fopen(host.c_str(), "r+b");
+        if (!f->fp) f->fp = std::fopen(host.c_str(), "rb");
+        if (!f->fp) return kAccessDenied;
+    }
+    W32(handle_out, NewHandle(f));
     return kSuccess;
 }
 

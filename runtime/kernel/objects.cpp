@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <map>
 #include <queue>
@@ -92,6 +93,14 @@ ObjectRef FromPointer(uint32_t guest) {
             o = std::make_shared<Object>(ObjType::Mutant);
             o->signal = state;
             break;
+        case 4: {  // QueueObject: R12, the packet-carrying port type so NtRemoveIoCompletion/PostIoCompletion accept it
+            // packets live host-side, and the port's SignalState must equal its packet count (a Wait on a
+            // signalled port with no packet would never block), so it starts empty; entries the guest
+            // linked into its own KQUEUE list cannot be carried over
+            if (state) LOG_FIRST(8, "objects: guest queue at %08X built with %d entries, starting empty", guest, state);
+            o = NewIoCompletion(R32(guest + 0x1C));
+            break;
+        }
         case 5:
             o = std::make_shared<Object>(ObjType::Semaphore);
             o->signal = state;
@@ -121,11 +130,21 @@ ObjectRef FromPointer(uint32_t guest) {
     Stamp(guest, serial);
     return o;
 }
-
 ObjectRef FindNamed(const std::string& name) {
     std::lock_guard<std::mutex> lock(g_names_lock);
     auto it = g_names.find(name);
-    return it == g_names.end() ? nullptr : it->second.lock();
+    if (it != g_names.end())
+        if (ObjectRef found = it->second.lock()) return found;
+    // the object namespace is case-insensitive (OBJ_CASE_INSENSITIVE): fall back to a folded match
+    auto fold = [](std::string s) {
+        for (char& c : s) c = char(std::toupper(uint8_t(c)));
+        return s;
+    };
+    std::string want = fold(name);
+    for (auto& [key, weak] : g_names)
+        if (fold(key) == want)
+            if (ObjectRef found = weak.lock()) return found;
+    return nullptr;
 }
 
 void AddNamed(const std::string& name, ObjectRef obj) {
@@ -179,12 +198,20 @@ int64_t Now100ns() {
     return t / 100 + 116444736000000000ll;
 }
 
+// D13: a span multiplied unchecked wraps a far-future wait (due == INT64_MIN, or anything beyond ~292
+// years) into the past and times out at once; saturate the deadline at INT64_MAX instead
+static int64_t AddSpan100(int64_t now, int64_t span_100ns) {
+    if (span_100ns <= 0) return now;
+    if (span_100ns > (INT64_MAX - now) / 100) return INT64_MAX;
+    return now + span_100ns * 100;
+}
+
 int64_t ToDeadline(int64_t due) {
     using namespace std::chrono;
     int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-    if (due < 0) return now + (-due) * 100;  // negative due is relative, positive is absolute system time
-    int64_t rel = due - Now100ns();
-    return now + std::max<int64_t>(rel, 0) * 100;
+    // negative due is relative, positive is absolute system time
+    if (due < 0) return AddSpan100(now, due == INT64_MIN ? INT64_MAX : -due);
+    return AddSpan100(now, due - Now100ns());
 }
 
 static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout, bool alertable) {
@@ -360,7 +387,8 @@ static void TimerLoop() {
         int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
         TimerEntry e = g_timers.top();
         if (e.deadline > now) {
-            g_timer_cv.wait_for(lock, nanoseconds(e.deadline - now));
+            // D13: a saturated deadline would overflow wait_for's own now + span; the cv is notified on every new timer
+            g_timer_cv.wait_for(lock, nanoseconds(std::min<int64_t>(e.deadline - now, 3600ll * 1000000000ll)));
             continue;
         }
         g_timers.pop();

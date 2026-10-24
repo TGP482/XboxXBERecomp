@@ -95,6 +95,11 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // The rows of the console's frame that hold picture. A TV overscanned the 480-line signal, so a
+    // title could draw a shorter picture inside the frame and no console ever showed the dead rows;
+    // a PC window has no overscan and shows them as black bars at the top and bottom. The host
+    // presents these rows alone, scaled to the output. Height 0 presents the whole frame.
+    uint32_t picture_top = 0, picture_height = 0;
 };
 extern const GameInfo kGame;
 

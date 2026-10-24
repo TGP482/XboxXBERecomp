@@ -32,6 +32,7 @@ enum : uint32_t {
     kNoMoreFiles = 0x80000006,
     kUnsuccessful = 0xC0000001,
     kNotImplemented = 0xC0000002,
+    kInvalidInfoClass = 0xC0000003,
     kInvalidHandle = 0xC0000008,
     kInvalidParameter = 0xC000000D,
     kNoSuchFile = 0xC000000F,
@@ -185,6 +186,10 @@ bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle);  // host path or empty
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+// io completion (iocp.cpp): queues one packet on a port made by NtCreateIoCompletion; a no-op for other objects
+void PostIoCompletion(const ObjectRef& port, uint32_t key, uint32_t apc_context, uint32_t status, uint32_t information);
+// R12: the one constructor of ObjType::Queue objects, so the type tag and the packet-carrying type always agree
+ObjectRef NewIoCompletion(uint32_t max_threads);
 
 // boot
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);
