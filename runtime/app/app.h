@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -98,10 +99,19 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // the host folder of the console's hard disk (its partitions, the saves on E:), given the folder's name: hdd, or
+    // hdd2 and on for a second copy (Instance). Once, before boot; null keeps it beside the exe
+    std::filesystem::path (*hard_disk)(const std::wstring& folder);
 };
 extern const GameInfo kGame;
 
-// sleeps out the rest of the frame for the fps cap
-void Pace();
+// sleeps out the rest of the frame: for the fps cap, and for the title's presentation interval (the vertical blanks a
+// frame stays up, 0 or 1 for none); Forza asks for two, a 30 frames a second game that steps its simulation once a frame
+void Pace(uint32_t interval = 1);
+// the frames a second Pace is holding the title to, the cap without an interval, 0 for none
+uint32_t TargetFps();
+// when the title's last swap was due to end (Pace's schedule), nothing before the first swap or after the title stopped
+// swapping for a while (a movie, a load); the vertical blank thread keeps half a frame from it
+std::chrono::steady_clock::time_point LastSwapSlot();
 
 }  // namespace app

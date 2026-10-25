@@ -30,7 +30,7 @@ This tool was originally created for porting [Tom Clancy's Splinter Cell: Double
    xbe_symbols assets\default.xbe sdk\xdk --library MyGame.dll --out config\game.toml
    ```
    This prints the XBE's library versions, picks `xdk/<build>/signatures.toml` and finds the XDK functions and data the host replaces, then writes the config: `[xbe]` with a partition count and the code sections, the `layout.toml` include, `[symbols]` and `[data]`. Misses and ambiguous names are listed and left at 0, which become trapping stubs. It stops when no `signatures.toml` exists for the XBE's build.
-4. Fill in `app::kGame` in `src/common/game_info.cpp`: title, window name, log and settings file names, splash, the xbe to exe table, game options, and the hooks for loading, the window, drawing and the pads.
+4. Fill in `app::kGame` in `src/common/game_info.cpp`: title, window name, log and settings file names, splash, the xbe to exe table, game options, and the hooks for loading, the window, drawing, the pads and where the hard disk (the saves) lives.
 5. Game hooks go in `src/game`. Define `X86_FUNC(sub_XXXXXXXX)` to replace a recompiled function, and call `__imp__sub_XXXXXXXX` to reach the original. `python sdk/tools/symbols/xbe2pe.py config/game.toml game.exe` writes a flat PE with the recompiled functions as exports for Ghidra.
 6. Run `build.bat`. One game repo can build several images, one config and `add_xbe_image` each; `--name` sets the config's `generated/<name>`, which is the folder argument of `add_xbe_image`.
 
@@ -64,10 +64,11 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 - **Renderer Extensions** - Allows a game to change render targets, add passes and add to the generated shaders through `gpu::Extension`, set with `gpu::SetExtension` from `GameInfo::init`.
 
 ### Audio
-- **DirectSound** - Mixes sound in software through XAudio2, with Xbox ADPCM, streams, mix bins and the effects image.
+- **DirectSound** - Mixes sound in software through XAudio2, with Xbox ADPCM, streams, mix bins, submixes and effect-in buffers, voice filters (DLS2, parametric EQ, I3DL2), 3D sound with the title's own HRTF set, and the effects image (its gains, mixers, filters, crosstalk, level meters and every I3DL2 reverb in it, set through `SetI3DL2Listener` or `XAudioSetEffectData`).
 
 ### Input
 - **Controller** - Supports Xbox, PlayStation and Switch controllers through SDL3, with hot plugging and rumble.
+- **Keyboard** - Plays as the controller in port 1 while the window has the focus: W and S the triggers, A and D the left stick across, the arrows the D-pad, I J K L the right stick, Space A, Escape B, X, Y, Q white, E black, Enter start, Tab back.
 
 ### General
 - **Disc Images** - Runs the game from an ISO in the `assets` folder, either a whole disc dump or the game partition, or from the extracted data files.
@@ -77,7 +78,8 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Miscellaneous
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
-- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`.
+- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`. A capture also saves `window.bmp`, the frame as the window shows it with the video overlay. `XBE_AUDIO_DUMP` writes the sound output to a WAV file, `XBE_NO_HRTF` and `XBE_NO_REVERB` leave the HRTF filters and the effects image's reverbs out, and a verbose log reports the mix's levels every few seconds. `XBE_MULTISAMPLE_TYPE` and `XBE_BACKBUFFER_SCALE` replace a title's multisample type and back buffer scale, to try the other frame buffer models. `XBE_TRACE_READS` logs each read of the files whose path holds its text, to see what a title streams. A verbose log names each controller's SDL driver and says when the keyboard takes port 1, and reports the gamma ramps a title sets and whether Windows HDR is on for the window's monitor.
+- **Scripted Controller** - `XBE_INPUT_SCRIPT` presses buttons and moves the left or right stick on a controller in port 1 at set times for unattended runs, and can hold its clock until the game logs a given line (a file open, say), so a script follows loading times. The syntax is in the comment above `LoadScript` in `runtime/core/input.cpp`.
 - **Headless Harness** - Builds and runs a game on Linux without a window, GPU, audio or controller, for testing.
 - **SDK Sync** - Keeps the `sdk/` copies in game repositories in step with this repository.
 
