@@ -95,6 +95,7 @@ struct Perf {
     uint64_t shaders = 0;
     uint64_t raw = 0;
     uint64_t lates = 0;
+    uint64_t fetches = 0;
 };
 Perf g_perf;
 struct PerfScope {
@@ -102,6 +103,16 @@ struct PerfScope {
     PerfClock::time_point t = PerfClock::now();
     ~PerfScope() { acc += PerfMs(t); }
 };
+
+// with diag::CaptureEvery set, true once that many seconds have passed since the last automatic capture
+bool AutoCaptureDue() {
+    if (diag::CaptureEvery() <= 0) return false;
+    static auto last = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - last).count() < diag::CaptureEvery()) return false;
+    last = now;
+    return true;
+}
 
 // F3 captures only with diag::CaptureDir set
 bool CaptureOn() {
@@ -136,6 +147,44 @@ float4 psmain(O i) : SV_Target {
 }
 )";
 
+// A colour keyed overlay: drawn only where the frame under it holds the key, which the video scaler compared with the
+// frame buffer's pixels. uvrect maps the overlay surface, framerect the frame; key.rgb is the key in 0 to 255, opts.x
+// the gamma lookup, opts.y the frame's range.
+const char* kKeyedOverlayHlsl = R"(
+cbuffer B : register(b1) { float4 uvrect; float4 framerect; float4 key; float4 opts; };
+Texture2D img : register(t0);
+Texture2D frame : register(t1);
+Texture2D lut : register(t2);
+SamplerState ls : register(s0);
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; float2 fuv : TEXCOORD1; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = uvrect.xy + t * uvrect.zw;
+    o.fuv = framerect.xy + t * framerect.zw;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+    float3 f = round(saturate(frame.SampleLevel(ps, i.fuv, 0).rgb * opts.y) * 255);
+    if (any(abs(f - key.rgb) > 0.5)) discard;
+    float4 c = img.SampleLevel(ls, i.uv, 0);
+    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    return float4(c.rgb, 1);
+}
+)";
+
+// a solid colour over the whole target, for clears of some channels only
+const char* kSolidHlsl = R"(
+cbuffer B : register(b1) { float4 color; };
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 psmain() : SV_Target { return color; }
+)";
+
 const char* kDepthHlsl = R"(
 Texture2D<float> img : register(t0);
 SamplerState ps : register(s1);
@@ -153,6 +202,25 @@ float Bits(uint32_t v) {
     float f;
     std::memcpy(&f, &v, 4);
     return f;
+}
+
+// Whether Windows runs the monitor in HDR, -1 when no output reports it. The compositor then maps this SDR frame into
+// HDR with the piecewise sRGB curve, which shows the dark end lighter than a 2.2 gamma display does. A factory keeps
+// the outputs' state from when it was made, so each look takes a new one.
+int MonitorHdr(HMONITOR monitor) {
+    ComPtr<IDXGIFactory1> factory;
+    if (!monitor || FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return -1;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT a = 0; factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+        ComPtr<IDXGIOutput> output;
+        for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
+            ComPtr<IDXGIOutput6> output6;
+            DXGI_OUTPUT_DESC1 d;
+            if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&d)) && d.Monitor == monitor)
+                return d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        }
+    }
+    return -1;
 }
 
 void Color(uint32_t argb, float* o) {
@@ -293,13 +361,34 @@ uint64_t MemSig(uint32_t data, uint32_t total) {
 // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
 bool Changed(const Target& t) {
     if (t.drawn || t.read.empty()) return false;
-    uint32_t row = t.gw * 4;
-    uint32_t pitch = GuestPitch(t.gw);
+    uint32_t row = t.gw * t.texel;
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
     for (uint32_t y = 0; y < t.gh; y++) {
-        if (std::memcmp(p + size_t(y) * pitch, &t.read[size_t(y) * row], row)) return true;
+        if (std::memcmp(p + size_t(y) * t.pitch, &t.read[size_t(y) * row], row)) return true;
     }
     return false;
+}
+
+// A host colour target is BGRA; an 8 bit guest surface (the console's B8 colour format, which the XDK's L8 and A8
+// targets use) keeps the blue byte of each pixel. BGRA rows of w, src_pitch apart, into packed rows of w bytes.
+std::vector<uint8_t> BlueBytes(const uint8_t* px, size_t src_pitch, uint32_t w, uint32_t h) {
+    std::vector<uint8_t> out(size_t(w) * h);
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) out[size_t(y) * w + x] = px[y * src_pitch + x * 4];
+    }
+    return out;
+}
+
+// a read-back's BGRA rows, row_pitch apart, into guest memory at dst in a target's guest layout
+void WriteGuestRows(uint8_t* dst, const uint8_t* p, uint32_t row_pitch, uint32_t gw, uint32_t gh, uint32_t pitch,
+                    uint8_t texel) {
+    if (texel == 4) {
+        for (uint32_t y = 0; y < gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * row_pitch, size_t(gw) * 4);
+        return;
+    }
+    for (uint32_t y = 0; y < gh; y++) {
+        for (uint32_t x = 0; x < gw; x++) dst[size_t(y) * pitch + x] = p[size_t(y) * row_pitch + x * 4];
+    }
 }
 
 // a lock alone proves nothing, reads lock too: only changed bytes mean the CPU wrote it
@@ -353,6 +442,7 @@ struct PsoKey {
     uint32_t cull;
     uint32_t ccw;
     uint32_t fill;
+    uint32_t zclamp;
     int32_t zbias;
     float zslope;
     uint32_t rtfmt;
@@ -415,12 +505,17 @@ public:
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
+    void Filter(const Surface& src, const Surface& dst, uint32_t w, uint32_t h) override;
     void Sync(uint32_t data, uint32_t size) override;
     void SyncLate(uint32_t data) override;
     bool DeliverLate(uint32_t data) override;
     void RecordLate(uint32_t data) override;
+    bool Fetching(uint32_t data) override;
+    void StartFetch(uint32_t data) override;
+    bool Fetched(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
+    void SetOverlay(const Overlay& overlay) override;
     void ClearReport() override { counted_.clear(); }
     // done once the list being recorded, the next fence value, has run
     void GetReport(uint32_t report) override { reports_.push_back({report, counted_, fence_value_ + 1}); }
@@ -503,6 +598,7 @@ private:
     ID3D12Resource* BindTexture(const State& s, int stage, DrawTextures& stages);
     ID3D12Resource* BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, bool box,
                                       DrawTextures& stages);
+    ID3D12Resource* BindTargetCube(int stage, const TextureDesc& d, DrawTextures& stages);
     ID3D12Resource* BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                      DrawTextures& stages);
     bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key);
@@ -534,7 +630,7 @@ private:
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
-    void SetViewportScissor(const State& s, uint32_t gw);
+    void SetViewportScissor(const State& s, GuestExtent size);
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
     void UploadVertexBuffers(const Assembled& a);
@@ -548,6 +644,7 @@ private:
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     // Blit's pipeline
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over = false);
+    ID3D12PipelineState* EnsureMaskedClearPipeline(DXGI_FORMAT rtv, uint8_t mask);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
     // Init, in order, each callee right after its caller
     bool CreateDevice();
@@ -561,11 +658,14 @@ private:
     void LoadSettings();
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
     void FinishCapture(const Surface& front);
+    void CapWindow(const Surface& front);
     void StartCapture();
     void ResizeSwap();
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
     void BlitFrame(Target& t);
+    void DrawOverlay(const Target& frame);
+    Tex* OverlayTexture();
     void RenderUi();
     void ReleaseOldTextures();
     void ResetFrame();
@@ -643,6 +743,10 @@ private:
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swap_;
+    HANDLE latency_wait_ = nullptr;  // signaled when the swap chain can take another frame (not ours to close)
+    UINT SwapFlags() const {
+        return (tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     ComPtr<ID3D12Resource> bb_[kFrames];
     ComPtr<ID3D12Fence> fence_;
     HANDLE event_ = nullptr;
@@ -693,6 +797,7 @@ private:
     uint8_t ramp_[768] = {};
     bool ramp_dirty_ = false;
     bool gamma_ = false;
+    Overlay overlay_;  // shown over the frame at present, as the console's video scaler did
     Target* bound_rt_ = nullptr;
     Target* bound_ds_ = nullptr;
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
@@ -712,11 +817,25 @@ private:
         uint64_t delivered = 0;
         uint32_t gw = 0;
         uint32_t gh = 0;
+        uint32_t pitch = 0;  // the target's guest layout
+        uint8_t texel = 4;
         uint32_t row_pitch = 0;
         uint32_t next = 0;
     };
     std::unordered_map<uint32_t, Late> late_;
     std::mutex late_lock_;                      // DeliverLate runs on the title's thread
+    // IsBusy's copies of drawn surfaces on their way to guest memory, by data address
+    struct Fetch {
+        ComPtr<ID3D12Resource> rb;
+        uint64_t bytes = 0;    // rb's size
+        uint64_t fence = 0;    // made once the GPU is past it
+        uint32_t gw = 0, gh = 0, pitch = 0, row_pitch = 0;
+        uint8_t texel = 4;
+        bool pending = false;  // started, not written yet
+        bool copied = false;   // a copy was recorded; without one there is nothing to write
+    };
+    std::unordered_map<uint32_t, Fetch> fetches_;
+    std::mutex fetch_lock_;                     // Fetched runs on the title's thread
     std::atomic<uint64_t> presents_seen_{0};    // presents_ for DeliverLate
     Assembled asm_;  // kept between draws for its buffers
     // visibility tests: an occlusion query per counted draw, summed into report memory once the GPU is done
@@ -736,6 +855,9 @@ private:
     std::vector<Query> counted_;  // since the last ClearReport
     std::deque<Report> reports_;
     bool tearing_ = false;
+    UINT sync_interval_ = 1;      // display refreshes a presented frame stays up
+    uint64_t sync_checked_ = 0;   // presents_ when the display's rate was last read
+    int hdr_ = -2;                // MonitorHdr as last logged, -2 before the first look
     uint64_t presents_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -804,7 +926,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = kFrames;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    sd.Flags = SwapFlags();
     ComPtr<IDXGISwapChain1> sc1;
     if (FAILED(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1))) {
         LOGE("d3d12: no swap chain");
@@ -812,6 +934,9 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     }
     factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     sc1.As(&swap_);
+    // one frame in flight: with several queued behind a long sync interval the picture would be that many frames old
+    swap_->SetMaximumFrameLatency(1);
+    latency_wait_ = swap_->GetFrameLatencyWaitableObject();
     return true;
 }
 
@@ -1105,7 +1230,17 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
     t.data = slot.data;
-    t.bytes = GuestPitch(slot.gw) * slot.gh;
+    // what Sync writes back keeps the surface's layout: 32 bit pixels at the pitch rounded to 64 bytes, or one byte a
+    // pixel for an 8 bit surface at its own pitch (Forza Motorsport's luminance target, an L8 sixteenth of the back
+    // buffer that the CPU reads)
+    TextureDesc d;
+    if (!depth && Describe(s.header, d) && Format(d.format).bits == 8) {
+        t.texel = 1;
+        t.pitch = !d.linear ? slot.gw : d.pitch ? d.pitch : (slot.gw + 63) & ~63u;
+    } else {
+        t.pitch = GuestPitch(slot.gw);
+    }
+    t.bytes = t.pitch * slot.gh;
     if (depth) t.bytes = slot.gw * slot.gh * 4;
     t.epoch = DirtyEpoch(slot.data);
     t.sig = MemSig(slot.data, t.bytes);
@@ -1210,11 +1345,10 @@ bool D3D12Backend::DepthCopy(const State& s) {
 // the pixels the CPU changed since the last Sync, opaque, the rest 0; t.read takes them
 std::vector<uint8_t> LatchCpuChanges(Target& t) {
     std::vector<uint8_t> px(t.read.size(), 0);
-    uint32_t guest_pitch = GuestPitch(t.gw);
     const uint8_t* guest = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
     for (uint32_t y = 0; y < t.gh; y++) {
         for (uint32_t x = 0; x < t.gw; x++) {
-            const uint8_t* c = guest + size_t(y) * guest_pitch + x * 4;
+            const uint8_t* c = guest + size_t(y) * t.pitch + x * 4;
             size_t i = (size_t(y) * t.gw + x) * 4;
             if (!std::memcmp(c, &t.read[i], 4)) continue;
             std::memcpy(&t.read[i], c, 4);
@@ -1397,6 +1531,22 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
     return pso.Get();
 }
 
+// a masked clear's pipeline, kept in blit_psos_: the solid colour, writing the D3D12_COLOR_WRITE_ENABLE channels in
+// mask; null when it can't be made
+constexpr uint64_t kMaskedClearKey = 0xC1EAull << 48;
+ID3D12PipelineState* D3D12Backend::EnsureMaskedClearPipeline(DXGI_FORMAT rtv, uint8_t mask) {
+    auto& pso = blit_psos_[kMaskedClearKey | uint64_t(rtv) << 8 | mask];
+    if (pso) return pso.Get();
+    uint64_t h;
+    ID3DBlob* vs = Compile(kSolidHlsl, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(kSolidHlsl, "psmain", "ps_5_0", h);
+    if (!vs || !ps) return nullptr;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = mask;
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
+    return pso.Get();
+}
+
 // Pass's pipeline for the shader, kept in blit_psos_; null when it can't be made
 ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv,
                                                       float blend) {
@@ -1520,7 +1670,7 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.RasterizerState.FrontCounterClockwise = k.ccw;
     d.RasterizerState.DepthBias = k.zbias;
     d.RasterizerState.SlopeScaledDepthBias = k.zslope;
-    d.RasterizerState.DepthClipEnable = TRUE;
+    d.RasterizerState.DepthClipEnable = !k.zclamp;  // off: depth clamped to the viewport's range
     FillDepthStencilDesc(k, d.DepthStencilState);
     d.PrimitiveTopologyType = TopologyType(k.topo);
     d.NumRenderTargets = k.has_rt ? 1 : 0;
@@ -1824,6 +1974,65 @@ void D3D12Backend::ReleasePackTextures() {
     pack_textures_.clear();
 }
 
+// textures_ entries of cube maps made from targets, apart from the guest textures keyed by palette and data
+constexpr uint64_t kTargetCubeKey = 1ull << 63;
+
+// A cube map whose faces the GPU drew, each as a surface over its face's memory (Forza Motorsport's car reflections,
+// three faces a frame): its faces come from those targets, copied once a frame into a cube of their size and format;
+// faces never drawn stay black. Null when no face is a target.
+ID3D12Resource* D3D12Backend::BindTargetCube(int stage, const TextureDesc& d, DrawTextures& stages) {
+    std::array<Target*, 6> faces{};
+    Target* any = nullptr;
+    for (uint32_t f = 0; f < 6; f++) {
+        auto it = targets_.find(SizedTargetKey(d.data + f * FaceSize(d), false, d.width, d.height));
+        if (it != targets_.end() && !it->second.depth && it->second.res) any = faces[f] = &it->second;
+    }
+    if (!any) return nullptr;
+    Tex& tx = textures_[kTargetCubeKey | d.data];
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!tx.res || tx.fmt != any->fmt || tx.res->GetDesc().Width != any->w || tx.res->GetDesc().Height != any->h) {
+        if (tx.res) CurrentFrame().garbage.push_back(tx.res);
+        tx = Tex{};
+        tx.d = d;
+        tx.fmt = any->fmt;
+        tx.levels = 1;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = any->w;
+        td.Height = any->h;
+        td.DepthOrArraySize = 6;
+        td.MipLevels = 1;
+        td.Format = tx.fmt;
+        td.SampleDesc.Count = 1;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&tx.res)))) {
+            textures_.erase(kTargetCubeKey | d.data);
+            return nullptr;
+        }
+        st = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if (tx.frame != presents_ + 1) {
+        tx.frame = presents_ + 1;
+        Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (uint32_t f = 0; f < 6; f++) {
+            Target* t = faces[f];
+            if (!t || t->fmt != tx.fmt || t->w != any->w || t->h != any->h) continue;
+            Resolve(*t);
+            Transition(t->res.Get(), t->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dl{tx.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            dl.SubresourceIndex = f;
+            D3D12_TEXTURE_COPY_LOCATION sl{t->res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            sl.SubresourceIndex = 0;
+            cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+        }
+        st = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    FillTextureView(tx, d, stages.sv[stage]);
+    return tx.res.Get();
+}
+
 ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
@@ -1849,6 +2058,9 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
     if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
         return BindTargetTexture(s, stage, d, tit->second, box, stages);
+    }
+    if (d.cube && !fi.depth && !fi.compressed) {
+        if (ID3D12Resource* r = BindTargetCube(stage, d, stages)) return r;
     }
     return BindGuestTexture(s, stage, d, fi, stages);
 }
@@ -2038,6 +2250,8 @@ void KeyRasterizer(const State& s, const Assembled& a, PsoKey& k) {
     k.cull = cull != 0 && a.topology == Topology::Triangles;
     k.ccw = cull == kCullCw;  // culling clockwise leaves counter clockwise as the front
     k.fill = s.rs[kRsFillMode];
+    // NV097_SET_ZMIN_MAX_CONTROL: bit 4 clamps depth instead of culling at the near and far planes (sky domes)
+    k.zclamp = (SimpleState(s, kMDepthClipControl) & 0x10) != 0;
 }
 
 void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k) {
@@ -2087,6 +2301,15 @@ void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
     c.surf[0] = float(size.w);
     c.surf[1] = float(size.h);
     c.surf[2] = 1.0f / s.zscale;
+    // the planes the title set for this kind of vertex shader; a draw that clamps depth keeps what is past them
+    bool program = (s.vs_handle & 1) != 0;
+    if (s.zplanes_set & (program ? 2 : 1) && !(SimpleState(s, kMDepthClipControl) & 0x10)) {
+        c.zclip[0] = s.zplanes[program ? 2 : 0];
+        c.zclip[1] = s.zplanes[program ? 3 : 1];
+        c.zclip[2] = 1;
+    }
+    c.ssf[0] = s.ss_x;
+    c.ssf[1] = s.ss_y;
     Color(s.rs[kRsFogColor], c.fog_color);
     c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
     c.misc[1] = SimpleState(s, kMAlphaTestEnable) ? float(Cmp(SimpleState(s, kMAlphaFunc)) - 1) : kAlphaTestAlways;
@@ -2257,6 +2480,10 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     FillSurfaceConstants(s, size, c);
     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
+    if (SimpleState(s, kMStippleEnable)) {
+        c.stip[0] = TargetScale();
+        for (uint32_t row = 0; row < 32; row++) c.stipple[row] = SimpleState(s, kMStipplePattern + row * 4);
+    }
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
@@ -2276,10 +2503,28 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         TextureDesc d;
         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
         bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
-        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
-                res ? "" : " unbound");
+        fprintf(cap_, " | t%d %08X fmt %X %ux%u", i, d.data, d.format, d.width, d.height);
+        if (d.depth > 1) fprintf(cap_, "x%u", d.depth);
+        fprintf(cap_, "%s%s%s", d.cube ? " cube" : "", tg ? " target" : "", res ? "" : " unbound");
+        if (d.levels > 1) fprintf(cap_, " mips %u", d.levels);
+        StagePalette palette;
+        ReadStagePalette(s, i, d, palette);
+        if (palette.va) {
+            fprintf(cap_, " pal %08X %08X %08X %08X %08X", palette.va, palette.colours[0], palette.colours[1],
+                    palette.colours[2], palette.colours[3]);
+        }
         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
+        }
+        if (res && !tg && stages.info[i].kind == kTex3D && cap_seen_.insert(d.data).second) {
+            // a volume as the title keeps it: tex3d_ADDR_FMT_WxHxD_levels.bin, for decoding off line
+            char name[64];
+            snprintf(name, sizeof(name), "tex3d_%08X_%X_%ux%ux%u_%u.bin", d.data, d.format, d.width, d.height, d.depth,
+                     d.levels);
+            if (FILE* f = _wfopen((cap_dir_ / name).c_str(), L"wb")) {
+                fwrite(kernel::HostPtr(d.data), 1, TotalSize(d), f);
+                fclose(f);
+            }
         }
     }
 }
@@ -2296,6 +2541,28 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
         fprintf(cap_, " [");
         for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
         fprintf(cap_, " ]");
+    }
+    // direct path: each register's format and offset, then the first vertices of each buffer as floats
+    if (a.vertices.empty()) {
+        for (int r = 0; r < 16; r++) {
+            if (a.regs >> r & 1) {
+                const VertexElement& e = a.elements[size_t(r)];
+                fprintf(cap_, " v%d:b%u+%u/f%u", r, e.buffer, e.offset, e.format);
+            }
+        }
+        for (uint32_t b = 0; b < a.buffer_count; b++) {
+            const VertexBuffer& vb = a.buffers[b];
+            if (!vb.src || !vb.stride) continue;
+            for (uint32_t v = 0; v < 4 && (v + 1) * vb.stride <= vb.bytes; v++) {
+                fprintf(cap_, " b%u[", b);
+                for (uint32_t k = 0; k + 4 <= vb.stride; k += 4) {
+                    float f;
+                    std::memcpy(&f, vb.src + v * vb.stride + k, 4);
+                    fprintf(cap_, " %g", f);
+                }
+                fprintf(cap_, " ]");
+            }
+        }
     }
     for (int r = 0; r < kVsConstants; r++) {
         const auto& v = s.vsc[r];
@@ -2318,6 +2585,8 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
             cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
+    if (SimpleState(s, kMStippleEnable)) fprintf(cap_, " stipple %08X %08X", c.stipple[0], c.stipple[1]);
+    if (s.rs[kRsTwoSidedLighting]) fprintf(cap_, " twosided");
     CaptureTextures(s, stages);
 }
 
@@ -2393,21 +2662,22 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
 }
 
 // viewport covers the target, the guest viewport is in the shader; scissor clips to it
-void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+// size: the console's grid of the target, which a multisampled target's samples stretch further in x or y
+void D3D12Backend::SetViewportScissor(const State& s, GuestExtent size) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
     cl_->RSSetViewports(1, &vp);
-    float sc = W / gw;
-    LONG x0 = LONG(s.viewport.x * sc);
-    LONG y0 = LONG(s.viewport.y * sc);
-    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sc);
-    LONG y1 = LONG((s.viewport.y + s.viewport.h) * sc);
+    float sx = W / size.w, sy = H / size.h;
+    LONG x0 = LONG(s.viewport.x * sx);
+    LONG y0 = LONG(s.viewport.y * sy);
+    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sx);
+    LONG y1 = LONG((s.viewport.y + s.viewport.h) * sy);
     if (s.scissor_count) {
-        x0 = std::max(x0, LONG(s.scissors[0] * sc));
-        y0 = std::max(y0, LONG(s.scissors[1] * sc));
-        x1 = std::min(x1, LONG(s.scissors[2] * sc));
-        y1 = std::min(y1, LONG(s.scissors[3] * sc));
+        x0 = std::max(x0, LONG(s.scissors[0] * sx));
+        y0 = std::max(y0, LONG(s.scissors[1] * sy));
+        x1 = std::min(x1, LONG(s.scissors[2] * sx));
+        y1 = std::min(y1, LONG(s.scissors[3] * sy));
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
@@ -2574,7 +2844,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // constants
     GuestExtent size;
-    SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+    RasterSize(s, bound_rt_ ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
     UploadConstants(s, sh, k, stages, size, c);
 
@@ -2586,20 +2856,28 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
     SetTextureViewsAndSamplers(s, a, stages);
-    SetViewportScissor(s, size.w);
+    SetViewportScissor(s, size);
     SetBlendFactorStencilRef(s);
 
     // geometry, counted while the title runs a visibility test
     uint32_t query = BeginCountedDraw(s);
     DrawGeometry(a);
     EndCountedDraw(query);
+    if (cap_ && bound_rt_ &&
+        ((diag::CaptureStep() && cap_i_ % diag::CaptureStep() == 0) || diag::CaptureInRange(cap_i_ - 1))) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X_step", cap_i_ - 1, bound_rt_->data);
+        CapSave(*bound_rt_, name);
+    }
 }
 
-// a guest rect scaled to the target and clamped to it
-D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
-    float sc = float(t.w) / t.gw;
-    return {std::clamp<LONG>(LONG(x0 * sc), 0, t.w), std::clamp<LONG>(LONG(y0 * sc), 0, t.h),
-            std::clamp<LONG>(LONG(x1 * sc), 0, t.w), std::clamp<LONG>(LONG(y1 * sc), 0, t.h)};
+// a guest rect on the console's grid of the target, scaled to the target and clamped to it
+D3D12_RECT ScaledRect(const State& s, const Target& t, int x0, int y0, int x1, int y1) {
+    uint32_t ax, ay;
+    SurfaceSamples(s, t.data, ax, ay);
+    float sx = float(t.w) * ax / t.gw, sy = float(t.h) * ay / t.gh;
+    return {std::clamp<LONG>(LONG(x0 * sx), 0, t.w), std::clamp<LONG>(LONG(y0 * sy), 0, t.h),
+            std::clamp<LONG>(LONG(x1 * sx), 0, t.w), std::clamp<LONG>(LONG(y1 * sy), 0, t.h)};
 }
 
 // rs: the rects buffer, reused across targets
@@ -2609,11 +2887,11 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         for (uint32_t i = 0; i < c.count; i++) {
             int32_t r[4];
             std::memcpy(r, c.rects + size_t(i) * sizeof(r), sizeof(r));
-            rs.push_back(ScaledRect(t, r[0], r[1], r[2], r[3]));
+            rs.push_back(ScaledRect(s, t, r[0], r[1], r[2], r[3]));
         }
     } else {
         const auto& v = s.viewport;
-        rs.push_back(ScaledRect(t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
+        rs.push_back(ScaledRect(s, t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
     }
     if (t.depth) {
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -2628,7 +2906,30 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         float col[4];
         Color(c.color, col);
         for (int i = 0; t.range != 1 && i < 3; i++) col[i] /= t.range;
-        cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), col, UINT(rs.size()), rs.data());
+        // D3DCLEAR_TARGET_R, _G, _B and _A clear those channels alone (Forza Motorsport clears alpha with depth)
+        uint32_t channels = c.flags & kClearTarget;
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), t.view, rtv_inc_);
+        if (channels == kClearTarget) {
+            cl_->ClearRenderTargetView(rh, col, UINT(rs.size()), rs.data());
+        } else if (ID3D12PipelineState* pso = EnsureMaskedClearPipeline(t.fmt, uint8_t(channels >> 4))) {
+            cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+            bound_rt_ = bound_ds_ = nullptr;
+            Alloc cb = Upload(256, 256);
+            std::memcpy(cb.cpu, col, sizeof(col));
+            uint32_t slot = AllocSrvSlots(1);
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = kBgra;
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+            D3D12_VIEWPORT vp{0, 0, float(t.w), float(t.h), 0, 1};
+            cl_->RSSetViewports(1, &vp);
+            for (const D3D12_RECT& r : rs) {
+                cl_->RSSetScissorRects(1, &r);
+                DrawFullScreen(pso, cb.gpu, slot);
+            }
+        }
     }
     t.drawn = true;
 }
@@ -2799,6 +3100,20 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
     bound_rt_ = bound_ds_ = nullptr;
 }
 
+void D3D12Backend::Filter(const Surface& src, const Surface& dst, uint32_t w, uint32_t h) {
+    if (cap_) fprintf(cap_, "%04u filter %08X (%ux%u) to %08X\n", cap_i_++, src.data, w, h, dst.data);
+    Target* s = FindTarget(src, false);
+    Target* d = EnsureTarget(dst, false);
+    if (!s || !d || s == d) return;
+    Resolve(*s);
+    Transition(s->res.Get(), s->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(d->res.Get(), d->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    SetBlitTarget(Cpu(rtv_heap_.Get(), d->view, rtv_inc_), d->w, d->h);
+    float uv[4] = {0, 0, std::min(float(w) / float(s->gw), 1.0f), std::min(float(h) / float(s->gh), 1.0f)};
+    Blit(s->res.Get(), s->fmt, uv, {.alpha = true, .rtv = d->fmt});
+    d->drawn = true;
+}
+
 void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                         uint32_t dst_points) {
     PerfScope perf_copy{g_perf.copy};
@@ -2846,7 +3161,7 @@ void D3D12Backend::ResizeSwap() {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, SwapFlags());
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
@@ -2855,6 +3170,11 @@ void D3D12Backend::ResizeSwap() {
 void D3D12Backend::FinishCapture(const Surface& front) {
     CapStep(Surface{});
     if (Target* f = FindTarget(front, false)) CapSave(*f, "final");
+    CapWindow(front);
+    if (Tex* ov = OverlayTexture()) {
+        D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        CapSave({.res = ov->res.Get(), .state = &st, .fmt = ov->fmt, .w = ov->d.width, .h = ov->d.height}, "overlay");
+    }
     for (auto& t : cap_tex_) {
         char name[32];
         snprintf(name, sizeof(name), "tex_%08X", t.data);
@@ -2925,6 +3245,112 @@ void D3D12Backend::BlitFrame(Target& t) {
     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
 }
 
+void D3D12Backend::SetOverlay(const Overlay& overlay) {
+    if (overlay.enabled && overlay.surface.header && !overlay_.surface.header)
+        LOGI("d3d12: overlay on, surface %08X format %02X, source %d,%d-%d,%d, destination %d,%d-%d,%d, key %s %08X",
+             overlay.surface.data, overlay.surface.format >> 8 & 0xFF, overlay.src[0], overlay.src[1], overlay.src[2],
+             overlay.src[3], overlay.dst[0], overlay.dst[1], overlay.dst[2], overlay.dst[3],
+             overlay.color_key ? "on" : "off", overlay.key);
+    overlay_ = overlay;
+}
+
+// the overlay surface as a texture, uploaded once a present: the title writes each movie frame with the CPU
+Tex* D3D12Backend::OverlayTexture() {
+    TextureDesc d;
+    if (!overlay_.enabled || !overlay_.surface.header || !DescribeSurface(overlay_.surface, d)) return nullptr;
+    const FormatInfo& fi = Format(d.format);
+    if (fi.compressed || fi.depth || d.cube || d.depth != 1) return nullptr;
+    const uint64_t key = uint64_t(1) << 63 | d.data;  // apart from the textures draws sample
+    Tex& tx = textures_[key];
+    bool same = SameTexture(tx, d);
+    if (!same && !CreateTexture(tx, d, fi, key)) return nullptr;
+    if (!same || tx.frame != presents_ + 1) {
+        tx.frame = presents_ + 1;
+        UploadTexture(tx, d, fi, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), nullptr, same);
+    }
+    return &tx;
+}
+
+// the frame as the window shows it, the overlay over it and the interface left out, as window.bmp in a capture
+void D3D12Backend::CapWindow(const Surface& front) {
+    Target* t = FindTarget(front, false);
+    if (!t || free_rtv_.empty()) return;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = td.Format;
+    ComPtr<ID3D12Resource> img;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                             IID_PPV_ARGS(&img)))) {
+        return;
+    }
+    // borrows the next free view for this recording, as Shrink does
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), free_rtv_.back(), rtv_inc_);
+    dev_->CreateRenderTargetView(img.Get(), nullptr, rh);
+    float black[4] = {0, 0, 0, 1};
+    cl_->ClearRenderTargetView(rh, black, 0, nullptr);
+    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    BlitFrame(*t);
+    DrawOverlay(*t);
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    CapSave({.res = img.Get(), .state = &st, .fmt = kBgra, .w = bb_w_, .h = bb_h_}, "window");
+    CurrentFrame().garbage.push_back(img);
+}
+
+// The overlay over the window's image, mapped as BlitFrame maps the frame. A colour keyed overlay shows only where
+// the frame holds the key.
+void D3D12Backend::DrawOverlay(const Target& frame) {
+    Tex* tx = OverlayTexture();
+    if (!tx) return;
+    const Overlay& o = overlay_;
+    bool wide = app::Widescreen();
+    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    float w = float(bb_w_), h = float(bb_h_);
+    float vw = std::min(w, h * aspect), vh = vw / aspect;
+    float ox = (w - vw) / 2, oy = (h - vh) / 2;
+    float gw = float(o.display_w ? o.display_w : frame.gw), gh = float(o.display_h ? o.display_h : frame.gh);
+    float dst[4] = {0, 0, gw, gh};
+    if (o.dst[2] > o.dst[0] && o.dst[3] > o.dst[1])
+        for (int i = 0; i < 4; i++) dst[i] = float(o.dst[i]);
+    float tw = float(tx->d.width), th = float(tx->d.height);
+    float src[4] = {0, 0, tw, th};
+    if (o.src[2] > o.src[0] && o.src[3] > o.src[1])
+        for (int i = 0; i < 4; i++) src[i] = float(o.src[i]);
+    D3D12_VIEWPORT vp{ox + dst[0] * vw / gw, oy + dst[1] * vh / gh, (dst[2] - dst[0]) * vw / gw,
+                      (dst[3] - dst[1]) * vh / gh, 0, 1};
+    D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
+    float uv[4] = {src[0] / tw, src[1] / th, (src[2] - src[0]) / tw, (src[3] - src[1]) / th};
+    if (!o.color_key) {
+        Blit(tx->res.Get(), tx->fmt, uv, {.gamma = gamma_});
+        return;
+    }
+    ID3D12PipelineState* pso = EnsurePassPipeline(kKeyedOverlayHlsl, "psmain", kBgra, -1);
+    if (!pso) return;
+    uint32_t slot = AllocSrvSlots(3);
+    ID3D12Resource* views[3] = {tx->res.Get(), frame.res.Get(), lut_.Get()};
+    DXGI_FORMAT formats[3] = {tx->fmt, frame.fmt, kBgra};
+    for (int i = 0; i < 3; i++) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = formats[i];
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        dev_->CreateShaderResourceView(views[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
+    // the key is a pixel of the frame buffer, X8R8G8B8
+    float c[16] = {uv[0], uv[1], uv[2], uv[3],
+                   dst[0] / gw, dst[1] / gh, (dst[2] - dst[0]) / gw, (dst[3] - dst[1]) / gh,
+                   float(o.key >> 16 & 0xFF), float(o.key >> 8 & 0xFF), float(o.key & 0xFF), 0,
+                   gamma_ ? 1.0f : 0.0f, frame.range, 0, 0};
+    Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, c, sizeof c);
+    DrawFullScreen(pso, cb.gpu, slot);
+}
+
 void D3D12Backend::RenderUi() {
     std::lock_guard lock(app::UiLock());
     ImGui_ImplDX12_NewFrame();
@@ -2946,6 +3372,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t);
+    if (t) DrawOverlay(*t);
     RenderUi();
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
 }
@@ -2993,11 +3420,22 @@ void D3D12Backend::CountFps() {
 }
 
 void LogPerf() {
-    static PerfClock::time_point perf_start = PerfClock::now();
-    static uint64_t perf_frames = 0;
+    static PerfClock::time_point perf_start = PerfClock::now(), last_present = perf_start;
+    static uint64_t perf_frames = 0, slow = 0, fast = 0;
+    static double longest = 0;
     perf_frames++;
+    // the time between presents: a steady game shows no slow ones (over 1.25 frames) and no fast ones (under 0.75)
+    double gap = PerfMs(last_present), frame = app::TargetFps() ? 1000.0 / app::TargetFps() : 16.667;
+    last_present = PerfClock::now();
+    longest = std::max(longest, gap);
+    slow += gap > frame * 1.25;
+    fast += gap < frame * 0.75;
     double el = PerfMs(perf_start);
     if (el >= 1000.0) {
+        LOGI("perf: present gaps: longest %.1f ms, %llu over 1.25 frames, %llu under 0.75 of %llu", longest,
+             (unsigned long long)slow, (unsigned long long)fast, (unsigned long long)perf_frames);
+        longest = 0;
+        slow = fast = 0;
         Perf& p = g_perf;
         double n = double(perf_frames);
         double host = p.draw + p.clear + p.copy + p.present + p.sync;
@@ -3017,10 +3455,10 @@ void LogPerf() {
              g_perf_sync_late.exchange(0) / n);
         LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
              "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
-             "%.1f read-backs %.1f late | %llu shaders %llu psos this second",
+             "%.1f read-backs %.1f late %.1f fetched | %llu shaders %llu psos this second",
              p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.sigs / n,
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
-             p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
+             p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n, p.fetches / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos);
         g_perf = Perf{};
         perf_start = PerfClock::now();
@@ -3032,7 +3470,7 @@ void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
     if (cap_) {
         FinishCapture(front);
-    } else if (g_capture.exchange(false) && CaptureOn()) {
+    } else if ((g_capture.exchange(false) || AutoCaptureDue()) && CaptureOn()) {
         StartCapture();
     }
     ResizeSwap();
@@ -3042,13 +3480,47 @@ void D3D12Backend::Present(const Surface& front) {
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    if (latency_wait_ && app::Get().vsync) WaitForSingleObjectEx(latency_wait_, 100, TRUE);
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
     Submit(false);
     DeliverReports();
     bool vsync = app::Get().vsync;
+    if (vsync && (!sync_checked_ || presents_ - sync_checked_ >= 120)) {
+        // A display that refreshes a whole number of times per game frame (240 or 120 Hz at a 60 frames cap) takes
+        // the frame for that many refreshes: with one, the title's own pacing picks which refresh a frame lands on and
+        // the frames stay up for uneven times. A rate that is no multiple keeps one and the title's pacing.
+        sync_checked_ = presents_ ? presents_ : 1;
+        UINT n = 1;
+        uint32_t cap = app::TargetFps();
+        // the rate of the monitor the window is on (DWM reports the primary monitor's; on a hybrid laptop the swap
+        // chain's own adapter may not drive that monitor at all)
+        HWND hwnd = static_cast<HWND>(app::Window());
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (cap && hwnd && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
+            double ratio = double(dm.dmDisplayFrequency) / cap, whole = std::round(ratio);
+            // DXGI holds a frame for 4 refreshes at most; a slower game's frame then stays up until the next one
+            if (whole >= 1 && std::fabs(ratio - whole) < 0.01 * whole) n = std::min<UINT>(UINT(whole), 4);
+        }
+        if (n != sync_interval_)
+            LOGI("d3d12: %u display refresh%s a frame (display %u Hz, cap %u fps)", n, n == 1 ? "" : "es",
+                 unsigned(dm.dmDisplayFrequency), cap);
+        sync_interval_ = n;
+    }
+    if (presents_ % 300 == 0) {
+        HWND hwnd = static_cast<HWND>(app::Window());
+        int hdr = MonitorHdr(hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr);
+        if (hdr != hdr_)
+            LOGI("d3d12: Windows HDR is %s on the window's monitor%s", hdr < 0 ? "unknown" : hdr ? "on" : "off",
+                 hdr > 0 ? ": the SDR frame is shown through Windows' SDR mapping, which lifts dark tones" : "");
+        hdr_ = hdr;
+    }
     auto perf_swap = PerfClock::now();
-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    swap_->Present(vsync ? sync_interval_ : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
     g_perf.swap += PerfMs(perf_swap);
 
     presents_++;
@@ -3111,10 +3583,11 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
     if (!src.res) return;
     std::vector<uint8_t> px;
     if (!ReadBack(src.res, t.gw, t.gh, px)) return;
-    // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
-    uint32_t pitch = GuestPitch(t.gw);
+    // color targets are linear in guest memory, rows t.pitch apart
+    if (t.texel == 1) px = BlueBytes(px.data(), size_t(t.gw) * 4, t.gw, t.gh);
+    uint32_t row = t.gw * t.texel;
     uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data));
-    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
+    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * t.pitch, &px[size_t(y) * row], row);
     t.read = std::move(px);
     t.drawn = false;
     t.sig = MemSig(t.data, t.bytes);
@@ -3155,9 +3628,7 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
         // the last row is not padded to the pitch: a range to the end of the pitch fails to map
         D3D12_RANGE rr{0, size_t(l.row_pitch) * (l.gh - 1) + l.gw * 4};
         if (FAILED(l.rb[best]->Map(0, &rr, reinterpret_cast<void**>(&p)))) return false;
-        uint32_t pitch = GuestPitch(l.gw);
-        uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
-        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * l.row_pitch, l.gw * 4);
+        WriteGuestRows(static_cast<uint8_t*>(kernel::HostPtr(data)), p, l.row_pitch, l.gw, l.gh, l.pitch, l.texel);
         D3D12_RANGE none{0, 0};
         l.rb[best]->Unmap(0, &none);
         l.delivered = l.fence[best];
@@ -3175,6 +3646,8 @@ void D3D12Backend::ResetLate(Late& l, const Target& t) {
     l = Late{};
     l.gw = t.gw;
     l.gh = t.gh;
+    l.pitch = t.pitch;
+    l.texel = t.texel;
 }
 
 // the target as a guest sized BGRA copy source, shrunk into l.down when it is not one already
@@ -3235,6 +3708,86 @@ void D3D12Backend::RecordLate(uint32_t data) {
     ID3D12Resource* src = PrepareLateSource(t, l);
     if (!src) return;
     RecordLateCopy(l, slot, src);
+}
+
+// without the render thread: a drawn surface is copied now and stays busy until the copy is made
+bool D3D12Backend::Fetching(uint32_t data) {
+    bool pending;
+    {
+        std::lock_guard lock(fetch_lock_);
+        auto f = fetches_.find(data);
+        pending = f != fetches_.end() && f->second.pending;
+    }
+    if (pending) return !Fetched(data);
+    auto it = targets_.find(TargetMapKey(data, false));
+    if (it == targets_.end() || !it->second.drawn || TargetStale(data)) return false;
+    StartFetch(data);
+    return true;
+}
+
+void D3D12Backend::StartFetch(uint32_t data) {
+    std::lock_guard lock(fetch_lock_);
+    Fetch& f = fetches_[data];
+    f.pending = true;
+    f.copied = false;
+    auto it = targets_.find(TargetMapKey(data, false));
+    if (it == targets_.end() || TargetStale(data)) return;
+    Target& t = it->second;
+    CopySource src = PrepareCopySource(t, {});
+    if (!src.res) return;
+    D3D12_RESOURCE_DESC rd = src.res->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT rows;
+    UINT64 row_size;
+    UINT64 bytes;
+    dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
+    if (!f.rb || f.bytes != bytes) {
+        if (f.rb) CurrentFrame().garbage.push_back(f.rb);
+        f.rb = nullptr;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd = BufferDesc(bytes);
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&f.rb)))) {
+            return;
+        }
+        f.bytes = bytes;
+    }
+    D3D12_TEXTURE_COPY_LOCATION dl{f.rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dl.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION sl{src.res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    if (src.down) CurrentFrame().garbage.push_back(src.down);
+    g_perf.fetches++;
+    f.fence = fence_value_ + 1;  // the next Submit carries it
+    f.gw = t.gw;
+    f.gh = t.gh;
+    f.pitch = t.pitch;
+    f.texel = t.texel;
+    f.row_pitch = fp.Footprint.RowPitch;
+    f.copied = true;
+    // the copy holds every draw so far, and what Fetched writes is no CPU change to upload back
+    t.drawn = false;
+    t.read.clear();
+}
+
+bool D3D12Backend::Fetched(uint32_t data) {
+    std::lock_guard lock(fetch_lock_);
+    auto it = fetches_.find(data);
+    if (it == fetches_.end() || !it->second.pending) return true;
+    Fetch& f = it->second;
+    if (f.copied) {
+        if (f.fence > fence_->GetCompletedValue()) return false;
+        uint8_t* p = nullptr;
+        // the last row is not padded to the pitch: a range to the end of the pitch fails to map
+        D3D12_RANGE rr{0, size_t(f.row_pitch) * (f.gh - 1) + f.gw * 4};
+        if (SUCCEEDED(f.rb->Map(0, &rr, reinterpret_cast<void**>(&p)))) {
+            WriteGuestRows(static_cast<uint8_t*>(kernel::HostPtr(data)), p, f.row_pitch, f.gw, f.gh, f.pitch, f.texel);
+            D3D12_RANGE none{0, 0};
+            f.rb->Unmap(0, &none);
+        }
+    }
+    f.pending = false;
+    return true;
 }
 
 // filters src into a new w x h target, left as a copy source

@@ -28,6 +28,8 @@ struct Target {
     uint32_t view = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     uint32_t data = 0, bytes = 0;
+    uint32_t pitch = 0;           // guest bytes a row
+    uint8_t texel = 4;            // guest bytes a pixel: 4, or 1 for the console's 8 bit colour format (B8)
     uint64_t epoch = 0, sig = 0;  // last lock seen, guest memory as last matched
     bool drawn = false;           // the GPU wrote it since the last readback
     std::vector<uint8_t> read;    // what Sync left in guest memory
