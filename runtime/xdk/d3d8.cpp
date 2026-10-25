@@ -371,6 +371,16 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
 
 // synchronisation, the renderer never runs behind
 
+namespace {
+// bytes a linear pixel container spans in guest memory, from its Size dword (pitch / 64 - 1 in bits 24..31, height - 1
+// in 12..23, as PersistDisplay reads it); 0 for a swizzled one, whose Size is 0 and whose span is unknown here
+uint32_t SurfaceBytes(uint32_t res) {
+    uint32_t size = R32(res + 0x10);
+    if (!size) return 0;
+    return ((size >> 24 & 0xFF) + 1) * 64 * ((size >> 12 & 0xFFF) + 1);
+}
+}  // namespace
+
 HLE_STDCALL(D3D_BlockOnResource, 1) {
     uint32_t res = a[0];
     if (res && g_backend) {
@@ -388,7 +398,7 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
                 }
                 LOGI("d3d: BlockOnResource on surface %08X, stack %08X %08X %08X %08X", data, code[0], code[1], code[2], code[3]);
             }
-            g_backend->Sync(data, 0);
+            g_backend->Sync(data, SurfaceBytes(res));
         } else {
             g_backend->WaitResource(res);
         }
@@ -402,7 +412,7 @@ HLE_WRAP(Lock2DSurface, 6) {
     uint32_t res = a[0];
     if ((a[5] & 0x20) && res && g_backend) {  // D3DLOCK_NOOVERWRITE
         std::lock_guard<std::recursive_mutex> lock(g_lock);
-        g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)));
+        g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)), SurfaceBytes(res));
     }
 }
 HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {

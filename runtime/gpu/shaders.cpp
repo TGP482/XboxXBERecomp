@@ -54,6 +54,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 amb;
     float4 lt[56];
     float4 rtshift;
+    float4 uvrect[4];
 };
 )";
 
@@ -404,7 +405,7 @@ std::string TexFetch(const PixelKey& k, int i) {
     };
     auto tex2d = [&](const std::string& uv) {
         if (t.flags & kTexWide) return F("spreadtap(tex%d, smp%d, %s, spread[%d], %s)", i, i, uv.c_str(), i, Hooks().ReadScale(t).c_str());
-        return F("tex%d.Sample(smp%d, %s)", i, i, uv.c_str());
+        return F("tex%d.Sample(smp%d, uvclamp((%s), uvrect[%d]))", i, i, uv.c_str(), i);
     };
     auto cube = [&](const std::string& dir) {
         std::string c = Hooks().Cube(t, i, dir);
@@ -479,6 +480,10 @@ const char* kPsTail = R"(float4 spreadtap(Texture2D t, SamplerState s, float2 uv
         }
     return c / (n * n);
 }
+// a small draw's texcoord rect, inset by half a texel: at render scale the edge pixels of an atlas
+// sprite would otherwise blend the texels past its rect (the neighbouring glyph in a font atlas),
+// which the console never sees because its edge pixels sample the rect's edge texel centres exactly
+float2 uvclamp(float2 uv, float4 r) { return r.z > r.x && r.w > r.y ? clamp(uv, r.xy, r.zw) : uv; }
 void alphatest(float a) {
     int f = (int)misc.y;
     int v = (int)round(a * 255), r = (int)misc.x;
@@ -926,7 +931,7 @@ std::string PixelHlsl(const PixelKey& k) {
                         F(", tc%d.z / tc%d.w, %d, i.pos.xy, texsize[%d].xy);\n", i, i, t.shadow, i);
             else if (t.kind == kTex2D && (t.flags & kTexWide))
                 body += F("float4 t%d = spreadtap(tex%d, smp%d, %s, spread[%d], %s);\n", i, i, i, uv.c_str(), i, Hooks().ReadScale(t).c_str());
-            else if (t.kind == kTex2D) body += F("float4 t%d = tex%d.Sample(smp%d, %s);\n", i, i, i, uv.c_str());
+            else if (t.kind == kTex2D) body += F("float4 t%d = tex%d.Sample(smp%d, uvclamp((%s), uvrect[%d]));\n", i, i, i, uv.c_str(), i);
             else if (t.kind == kTexCube && !(cube = Hooks().Cube(t, i, F("tc%d.xyz", i))).empty()) body += F("float4 t%d = %s;\n", i, cube.c_str());
             else if (t.kind) body += F("float4 t%d = tex%d.Sample(smp%d, tc%d.xyz);\n", i, i, i, i);
             else body += F("float4 t%d = float4(1,1,1,1);\n", i);

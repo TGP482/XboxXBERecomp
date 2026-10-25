@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -243,6 +244,37 @@ uint8_t ShadowDepthKind(uint32_t format) { return format == kFmtD16 || format ==
 // bytes per row of a 32 bit surface in guest memory, rounded to 64
 uint32_t GuestPitch(uint32_t width) { return (width * 4 + 63) & ~63u; }
 
+// A read-back writes GuestPitch(gw) rows of gh into guest memory. Targets are found by address alone, so a smaller
+// surface the title allocated where a freed target lived would take the old target's size: refused when the title's
+// own size for the surface is smaller. size 0 is unknown (a swizzled container) and is written as before.
+bool ReadBackFits(uint32_t data, uint32_t gw, uint32_t gh, uint32_t size) {
+    uint64_t bytes = uint64_t(GuestPitch(gw)) * gh;
+    if (!size || bytes <= size) return true;
+    static std::mutex m;
+    static std::unordered_set<uint32_t> refused;
+    bool first;
+    {
+        std::lock_guard lock(m);
+        first = refused.insert(data).second && refused.size() <= 32;
+    }
+    if (first) {
+        LOGW("d3d12: read-back of %08X refused, its %ux%u target needs %llu bytes, the surface has %u", data, gw, gh,
+             (unsigned long long)bytes, size);
+    }
+    return false;
+}
+
+// The first physical megabyte holds the kernel's variables, never a surface: a surface whose data allocation failed
+// (physical 0) must not take a read-back there, or the pixels land on kernel data
+bool LowPhysical(uint32_t data) {
+    if (data < mem::kKernelDataBase || data >= mem::kKernelDataBase + mem::kKernelDataSize) return false;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        LOGW("d3d12: read-back to low physical %08X refused (surface data allocation failed?)", data);
+    }
+    return true;
+}
+
 // rows of a texture upload start D3D12_TEXTURE_DATA_PITCH_ALIGNMENT apart
 uint32_t UploadPitch(uint32_t row_bytes) { return (row_bytes + 255) & ~255u; }
 
@@ -412,8 +444,8 @@ public:
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
     void Sync(uint32_t data, uint32_t size) override;
-    void SyncLate(uint32_t data) override;
-    bool DeliverLate(uint32_t data) override;
+    void SyncLate(uint32_t data, uint32_t size) override;
+    bool DeliverLate(uint32_t data, uint32_t size) override;
     void RecordLate(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
@@ -529,7 +561,8 @@ private:
     void SetViewportScissor(const State& s, uint32_t gw);
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
-    void UploadVertexBuffers(const Assembled& a);
+    // false when a buffer got no upload memory (logged by Upload): the draw is skipped
+    bool UploadVertexBuffers(const Assembled& a);
     // visibility tests
     bool EnsureQueries();
     uint32_t BeginCountedDraw(const State& s);
@@ -952,12 +985,24 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
     constexpr uint64_t kOwnAlign = 0x10000;  // a committed buffer's size granularity
     D3D12_RESOURCE_DESC bd = BufferDesc((size + kOwnAlign - 1) & ~(kOwnAlign - 1));
-    dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                  IID_PPV_ARGS(&r));
+    HRESULT hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                               nullptr, IID_PPV_ARGS(&r));
     uint8_t* p = nullptr;
-    r->Map(0, nullptr, reinterpret_cast<void**>(&p));
-    f.garbage.push_back(r);
-    return {r.Get(), 0, p, r->GetGPUVirtualAddress()};
+    if (SUCCEEDED(hr)) hr = r->Map(0, nullptr, reinterpret_cast<void**>(&p));
+    if (SUCCEEDED(hr)) {
+        f.garbage.push_back(r);
+        return {r.Get(), 0, p, r->GetGPUVirtualAddress()};
+    }
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOGE("d3d12: upload buffer of %llu bytes not made, hr %08lX, device removed reason %08lX",
+             (unsigned long long)size, (unsigned long)hr, (unsigned long)dev_->GetDeviceRemovedReason());
+    }
+    // the ring again from its start: draws already recorded this frame may read bytes written over (a garbled frame,
+    // not a null pointer); a request bigger than the whole ring gets no memory, cpu null, and its caller skips it
+    if (size > kUploadSize) return {nullptr, 0, nullptr, 0};
+    f.used = size;
+    return {f.upload.Get(), 0, f.map, f.upload->GetGPUVirtualAddress()};
 }
 
 uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
@@ -1215,16 +1260,25 @@ std::vector<uint8_t> LatchCpuChanges(Target& t) {
     return px;
 }
 
-// BGRA pixels into a new w x h texture, left as a shader resource
+// BGRA pixels into a new w x h texture, left as a shader resource; null when the texture or its upload is not made
 ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_t>& px, uint32_t pitch, uint32_t w,
                                                         uint32_t h) {
     ComPtr<ID3D12Resource> tex;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_B8G8R8A8_UNORM, w, h);
-    dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                  IID_PPV_ARGS(&tex));
+    HRESULT hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&tex));
+    if (FAILED(hr)) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOGE("d3d12: %ux%u pixel texture not made, hr %08lX, device removed reason %08lX", w, h, (unsigned long)hr,
+                 (unsigned long)dev_->GetDeviceRemovedReason());
+        }
+        return nullptr;
+    }
     uint32_t row = UploadPitch(w * 4);
     Alloc a = Upload(uint64_t(row) * h, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    if (!a.cpu) return nullptr;  // logged by Upload
     for (uint32_t y = 0; y < h; y++) std::memcpy(a.cpu + size_t(y) * row, &px[size_t(y) * pitch], w * 4);
     D3D12_TEXTURE_COPY_LOCATION dst{tex.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION src{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -1253,6 +1307,7 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
         DecodeLevel(d, 0, 0, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), nullptr, px, pitch);
     }
     ComPtr<ID3D12Resource> tex = CreatePixelTexture(px, pitch, d.width, d.height);
+    if (!tex) return;  // logged; the target keeps its picture
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     SetBlitTarget(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), t.w, t.h);
     float uv[4] = {0, 0, 1, 1};
@@ -1663,6 +1718,7 @@ void D3D12Backend::UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std
     uint32_t sub = f * tx.levels + l;
     dev_->GetCopyableFootprints(&rd, sub, 1, 0, &fp, &rows, &row_size, &bytes);
     Alloc a = Upload(bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    if (!a.cpu) return;  // logged by Upload; the level keeps what it had
     CopyLevelRows(a.cpu, fp, rows, row_size, px, pitch);
     fp.Offset = a.off;
     D3D12_TEXTURE_COPY_LOCATION dl{tx.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -2309,6 +2365,109 @@ bool UnitTexcoords(const Assembled& a) {
     return any;
 }
 
+// One input register's texcoord rect over a small draw's vertices, in the units the guest
+// wrote them (texels for a linear texture, 0..1 otherwise). False when the vertices cannot be
+// read safely, so the stage keeps its unclamped sampling.
+bool TexcoordRect(const Assembled& a, int reg, float lo[2], float hi[2]) {
+    constexpr uint32_t kSmallDrawVertices = 4096;  // most vertices a small draw has
+    if (!a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return false;
+    if (!(a.regs >> reg & 1)) return false;
+    const VertexElement& e = a.elements[size_t(reg)];
+    if (e.format != DXGI_FORMAT_R32G32_FLOAT && e.format != DXGI_FORMAT_R32G32B32A32_FLOAT) return false;
+    const VertexBuffer& vb = a.buffers[e.buffer];
+    if (!vb.src || !vb.stride || uint64_t(a.vertex_count) * vb.stride > vb.bytes) return false;
+    const uint32_t in_buffer = vb.bytes / vb.stride;
+    lo[0] = lo[1] = 3.4028235e38f;
+    hi[0] = hi[1] = -3.4028235e38f;
+    auto read = [&](uint32_t v) {
+        float uv[2];
+        std::memcpy(uv, vb.src + size_t(v) * vb.stride + e.offset, sizeof(uv));
+        if (!std::isfinite(uv[0]) || !std::isfinite(uv[1])) return false;
+        lo[0] = std::min(lo[0], uv[0]);
+        lo[1] = std::min(lo[1], uv[1]);
+        hi[0] = std::max(hi[0], uv[0]);
+        hi[1] = std::max(hi[1], uv[1]);
+        return true;
+    };
+    if (!a.indices.empty()) {
+        if (a.indices.size() > 3 * kSmallDrawVertices) return false;
+        for (uint32_t idx : a.indices) {
+            if (idx >= in_buffer || !read(idx)) return false;
+        }
+    } else {
+        for (uint32_t v = 0; v < a.vertex_count; v++)
+            if (!read(v)) return false;
+    }
+    return hi[0] > lo[0] && hi[1] > lo[1];
+}
+
+// Per stage, the draw's own texcoord rect inset by half a texel, for the pixel shader's uvclamp:
+// a sprite or glyph drawn from one cell of an atlas must not blend the texels past its cell at
+// render scale, where the edge pixels land between texel centres instead of on them as they do
+// on the console. Only single-quad draws qualify: one quadlist of four vertices, a single-level
+// 2D stage, and a texcoord register that is certain - the fixed pipeline's set register, or a
+// programmable draw with exactly one float texcoord register past the position (a draw with
+// more candidates could be reading any of them, so it is left alone). Tiled coordinates
+// (outside the texture), render-target stages and shadow stages keep the sampling they had.
+void FillUvRectConstants(const State& s, uint32_t prim, uint32_t count, const Assembled& a, const DrawShaders& sh,
+                         const DrawTextures& stages, DrawConstants& c) {
+    // XBE_NO_UVRECT=1: leave every stage unclamped, for bisecting a seam against the stock sampling
+    static const bool kOff = std::getenv("XBE_NO_UVRECT") != nullptr;
+    if (kOff) return;
+    constexpr uint32_t kPrimQuadList = 8;  // D3DPT_QUADLIST: the 2D sprite system's one quad
+    if (prim != kPrimQuadList || count != 4 || a.vertex_count != 4) return;
+
+    int candidate = -1;
+    if (!sh.prog) {
+        candidate = -2;  // per stage below: the fixed pipeline's texcoord set register
+    } else {
+        for (int r = 1; r < 16; r++) {
+            if (!(a.regs >> r & 1)) continue;
+            const VertexElement& e = a.elements[size_t(r)];
+            if (e.format != DXGI_FORMAT_R32G32_FLOAT && e.format != DXGI_FORMAT_R32G32B32A32_FLOAT) continue;
+            if (candidate >= 0) return;  // a second float register: no longer certain which is read
+            candidate = r;
+        }
+        if (candidate < 0) return;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (!stages.res[i] || stages.rt[i] || stages.info[i].kind != kTex2D || stages.info[i].shadow ||
+            (stages.info[i].flags & kTexWide) || !s.textures[size_t(i)])
+            continue;
+        TextureDesc d;
+        if (!Describe(s.textures[size_t(i)], d) || !d.width || !d.height || d.levels != 1) continue;
+        // generated texture coordinates are not the input's rect in the shader's space
+        if (!sh.prog && ((sh.fk.tex[i] >> 4) & 7)) continue;
+        const int reg = candidate >= 0 ? candidate : 9 + int(sh.fk.tex[i] & 3);
+        float lo[2], hi[2];
+        if (!TexcoordRect(a, reg, lo, hi)) continue;
+        const float w = float(d.width), h = float(d.height);
+        // inset by half a texel: the sample range is the rect's edge texel centres, as on the console
+        constexpr float kInset = 0.5f;
+        float l, t, r, b;
+        if (stages.info[i].rect) {  // texel units: the rect's edge texels are lo..hi-1
+            if (lo[0] < -0.5f || lo[1] < -0.5f || hi[0] > w + 0.5f || hi[1] > h + 0.5f) continue;
+            l = (lo[0] + kInset) / w;
+            r = (hi[0] - kInset) / w;
+            t = (lo[1] + kInset) / h;
+            b = (hi[1] - kInset) / h;
+        } else {  // 0..1 over the whole texture
+            if (lo[0] < -1e-4f || lo[1] < -1e-4f || hi[0] > 1.0001f || hi[1] > 1.0001f) continue;
+            l = lo[0] + kInset / w;
+            r = hi[0] - kInset / w;
+            t = lo[1] + kInset / h;
+            b = hi[1] - kInset / h;
+        }
+        if (r <= l) { l = r = (l + r) * 0.5f; r += 1e-7f; }
+        if (b <= t) { t = b = (t + b) * 0.5f; b += 1e-7f; }
+        c.uvrect[i][0] = l;
+        c.uvrect[i][1] = t;
+        c.uvrect[i][2] = r;
+        c.uvrect[i][3] = b;
+    }
+}
+
 // a stage without a texture gets a null view of its kind; the samplers read the views after
 void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages) {
     uint32_t slot = AllocSrvSlots(4);
@@ -2362,23 +2521,26 @@ D3D_PRIMITIVE_TOPOLOGY PrimitiveTopology(const Assembled& a) {
     return a.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 }
 
-void D3D12Backend::UploadVertexBuffers(const Assembled& a) {
+bool D3D12Backend::UploadVertexBuffers(const Assembled& a) {
     D3D12_VERTEX_BUFFER_VIEW vbv[16];
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
         Alloc vb = Upload(b.bytes, 16);
+        if (!vb.cpu) return false;
         std::memcpy(vb.cpu, b.src, b.bytes);
         vbv[i] = {vb.gpu, b.bytes, b.stride};
     }
     cl_->IASetVertexBuffers(0, a.buffer_count, vbv);
+    return true;
 }
 
 void D3D12Backend::DrawGeometry(const Assembled& a) {
-    UploadVertexBuffers(a);
+    if (!UploadVertexBuffers(a)) return;
     cl_->IASetPrimitiveTopology(PrimitiveTopology(a));
     if (a.index_count) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
         Alloc ib = Upload(ibytes, 4);
+        if (!ib.cpu) return;
         std::memcpy(ib.cpu, a.index_src, ibytes);
         D3D12_INDEX_BUFFER_VIEW ibv{ib.gpu, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         cl_->IASetIndexBuffer(&ibv);
@@ -2509,6 +2671,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     GuestExtent size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
+    FillUvRectConstants(s, prim, count, a, sh, stages, c);
     UploadConstants(s, sh, k, stages, size, c);
 
     if (cap_) {
@@ -2702,6 +2865,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
     Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION dl{dst_t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION sl{src_res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    float src_scale = float(src_t.w) / src_t.gw;
     float dst_scale = float(dst_t.w) / dst_t.gw;
     bool listed = l.count && l.src_rects;
     uint32_t n = listed ? l.count : 1;
@@ -2711,12 +2875,14 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
         uint32_t dy = 0;
         if (listed) {
             GuestRect r = ReadGuestRect(l.src_rects, i);
-            b.left = ScaleUnsigned(r.left, dst_scale);
-            b.top = ScaleUnsigned(r.top, dst_scale);
-            b.right = std::min(ScaleUnsigned(r.right, dst_scale), src_t.w);
-            b.bottom = std::min(ScaleUnsigned(r.bottom, dst_scale), src_t.h);
-            dx = b.left;
-            dy = b.top;
+            // the source box is in the source's texels, the destination point in the destination's:
+            // scaling the box by dst_scale read the wrong region whenever the two scales differed
+            b.left = ScaleUnsigned(r.left, src_scale);
+            b.top = ScaleUnsigned(r.top, src_scale);
+            b.right = std::min(ScaleUnsigned(r.right, src_scale), src_t.w);
+            b.bottom = std::min(ScaleUnsigned(r.bottom, src_scale), src_t.h);
+            dx = ScaleUnsigned(r.left, dst_scale);
+            dy = ScaleUnsigned(r.top, dst_scale);
             if (l.dst_points) {
                 GuestPoint p = ReadGuestPoint(l.dst_points, i);
                 dx = ScaleUnsigned(p.x, dst_scale);
@@ -3028,9 +3194,11 @@ bool D3D12Backend::TargetStale(uint32_t data) const {
 }
 
 // the CPU reads a surface the GPU drew: bring the pixels back
-void D3D12Backend::Sync(uint32_t data, uint32_t) {
+void D3D12Backend::Sync(uint32_t data, uint32_t size) {
+    if (LowPhysical(data)) return;
     auto it = targets_.find(TargetMapKey(data, false));
     if (it == targets_.end() || !it->second.drawn || TargetStale(data)) return;
+    if (!ReadBackFits(data, it->second.gw, it->second.gh, size)) return;
     PerfScope perf_sync{g_perf.sync};
     g_perf.syncs++;
     if (diag::Perf()) {
@@ -3054,16 +3222,19 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
 
 // A NOOVERWRITE lock: the console reads whatever the GPU has finished, so a surface locked every frame gets the newest
 // finished copy (a frame or two old) and the CPU never waits on the GPU; one locked now and then still waits in Sync
-void D3D12Backend::SyncLate(uint32_t data) {
-    if (!DeliverLate(data)) Sync(data, 0);
+void D3D12Backend::SyncLate(uint32_t data, uint32_t size) {
+    if (!DeliverLate(data, size)) Sync(data, size);
     RecordLate(data);
 }
 
-bool D3D12Backend::DeliverLate(uint32_t data) {
+bool D3D12Backend::DeliverLate(uint32_t data, uint32_t size) {
+    if (LowPhysical(data)) return false;
     std::lock_guard lock(late_lock_);
     auto it = late_.find(data);
     if (it == late_.end()) return false;
     Late& l = it->second;
+    // copies of an older, larger target at this address: Sync then reads the surface's current target, if it fits
+    if (!ReadBackFits(data, l.gw, l.gh, size)) return false;
     uint64_t done = fence_->GetCompletedValue();
     uint64_t now = presents_seen_.load();
     int best = -1;

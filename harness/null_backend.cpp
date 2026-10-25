@@ -68,7 +68,7 @@ public:
         if (cap && frames_ % cap == 0) list_ = std::fopen(File("cap/draws_%05llu.txt", frames_).c_str(), "w");
     }
     void Sync(uint32_t, uint32_t) override {}
-    void SyncLate(uint32_t) override {}
+    void SyncLate(uint32_t, uint32_t) override {}
     void Flush() override {}
     void SetGamma(const uint8_t*) override {}
 

@@ -27,13 +27,14 @@ public:
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects_va,
                       uint32_t dst_points_va) = 0;
     virtual void Present(const Surface& front) = 0;
-    // the CPU is about to touch this resource's memory: write GPU results back first
+    // the CPU is about to touch this resource's memory: write GPU results back first. size: the surface's bytes in
+    // guest memory, 0 when unknown; a read-back that would write more than size is refused
     virtual void Sync(uint32_t data_va, uint32_t size) = 0;
     // a lock that does not wait for the GPU (NOOVERWRITE): a result a frame or two old is what the console gives too
-    virtual void SyncLate(uint32_t data_va) = 0;
+    virtual void SyncLate(uint32_t data_va, uint32_t size) = 0;
     // SyncLate in two for the render thread: DeliverLate (any thread) writes the newest finished copy to guest memory,
     // false when there is none recent; RecordLate (in order with the draws) starts a copy for a later lock
-    virtual bool DeliverLate(uint32_t) { return false; }
+    virtual bool DeliverLate(uint32_t /*data_va*/, uint32_t /*size*/) { return false; }
     virtual void RecordLate(uint32_t) {}
     virtual void Flush() = 0;
     virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;

@@ -188,13 +188,13 @@ public:
         last_present_ = id;
     }
 
-    void Sync(uint32_t data, uint32_t) override { ReadBack(data, false); }
+    void Sync(uint32_t data, uint32_t size) override { ReadBack(data, false, size); }
 
-    void SyncLate(uint32_t data) override {
-        if (!inner_->DeliverLate(data)) {
+    void SyncLate(uint32_t data, uint32_t size) override {
+        if (!inner_->DeliverLate(data, size)) {
             if (diag::Perf()) LOG_FIRST(16, "render thread: no finished copy of %08X for a NOOVERWRITE lock, reading it back now", data);
             written_.insert(data);
-            ReadBack(data, true);
+            ReadBack(data, true, size);
         }
         Cmd c{Op::RecordLate};
         c.a = data;
@@ -254,7 +254,8 @@ private:
         return uint32_t(at);
     }
 
-    void ReadBack(uint32_t data, bool late) {
+    // size: the surface's bytes in guest memory for the backend's overrun check, 0 when unknown
+    void ReadBack(uint32_t data, bool late, uint32_t size) {
         // only surfaces the GPU wrote since the last read-back hold anything newer than guest memory
         if (!written_.erase(data)) return;
         (late ? g_perf_sync_late : g_perf_sync_block)++;
@@ -262,6 +263,7 @@ private:
             LOGI("render thread: read-back of %08X for %s", data, late ? "a NOOVERWRITE lock without a finished copy" : "a lock / BlockOnResource");
         Cmd c{Op::Sync};
         c.a = data;
+        c.b = size;
         cur_->cmds.push_back(c);
         Wait(Submit(), WaitFor::ReadBack, "read-back");
     }
@@ -434,7 +436,7 @@ private:
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
             case Op::Present: inner_->Present(c.s1); break;
-            case Op::Sync: inner_->Sync(c.a, 0); break;
+            case Op::Sync: inner_->Sync(c.a, c.b); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;
             case Op::Gamma: inner_->SetGamma(data); break;
