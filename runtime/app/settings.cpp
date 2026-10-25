@@ -49,6 +49,9 @@ void Load() {
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
+    std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect]));
+    for (uint32_t i = 0; i < 3; i++)
+        if (aspect == kAspects[i]) s.aspect = i;
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
@@ -68,6 +71,7 @@ toml::table Table() {
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
+                  {"aspect", kAspects[std::min(s.aspect, 2u)]},
                   {"join_ip", s.join_ip}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
@@ -115,10 +119,10 @@ bool Widescreen() {
     static std::atomic<uint64_t> key{~0ull};
     static std::atomic<bool> wide{true};
     const Settings& s = Get();
-    uint64_t k = uint64_t(s.width) << 32 | s.height;
+    uint64_t k = uint64_t(s.width) << 34 | uint64_t(s.height) << 2 | std::min(s.aspect, 2u);
     if (key.exchange(k) != k) {
         Mode m = Output();
-        wide = m.width * 2 >= m.height * 3;  // 3:2 or wider
+        wide = s.aspect == 0 ? m.width * 2 >= m.height * 3 : s.aspect == 2;  // auto: 3:2 or wider
     }
     return wide;
 }
