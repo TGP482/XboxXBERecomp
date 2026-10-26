@@ -35,6 +35,9 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
     fs::create_directories(dir, ec);
     if (!kVerbose) {
         g_path = (fs::path(dir) / (prefix + ".log")).string();
+        // the run before stays as prefix.previous.log: a player who starts the game again after a crash still has
+        // the crash's log to send
+        if (!append) fs::rename(g_path, fs::path(dir) / (prefix + ".previous.log"), ec);
         g_file = std::fopen(g_path.c_str(), append ? "a" : "w");
         return;
     }
@@ -52,7 +55,7 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
 const std::string& Path() { return g_path; }
 
 void Write(Level lv, const char* fmt, ...) {
-    if (!kVerbose && lv < Level::Error) return;
+    if (!kVerbose && lv < Level::Warn) return;
     char msg[4096];
     va_list ap;
     va_start(ap, fmt);
@@ -64,7 +67,8 @@ void Write(Level lv, const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(g_mutex);
     char line[4300];
     int n = kVerbose ? std::snprintf(line, sizeof(line), "[%9.3f] [%s] [t%04zx] %s\n", t, names[int(lv)], size_t(tid), msg)
-                     : std::snprintf(line, sizeof(line), "[%9.3f] %s%s\n", t, lv == Level::Error ? "error: " : "", msg);
+                     : std::snprintf(line, sizeof(line), "[%9.3f] %s%s\n", t,
+                                     lv == Level::Error ? "error: " : lv == Level::Warn ? "warning: " : "", msg);
     n = std::min(n, int(sizeof(line)) - 1);
     if (g_file) {
         std::fwrite(line, 1, size_t(n), g_file);

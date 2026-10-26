@@ -7,13 +7,16 @@
 #endif
 #include <windows.h>
 #include <dbghelp.h>
+#include <intrin.h>
 #include <timeapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cwchar>
 #include <thread>
+#include <vector>
 
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
@@ -36,6 +39,27 @@ constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2;
 bool g_mode_changed = false;
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
 
+// the newest few dumps stay: a player never clears the folder
+void PruneCrashDumps(const std::filesystem::path& dir) {
+    constexpr size_t kKeep = 10;
+    std::vector<std::filesystem::path> dumps;
+    std::error_code ec;
+    for (auto& e : std::filesystem::directory_iterator(dir, ec))
+        if (e.path().extension() == L".dmp") dumps.push_back(e.path());
+    std::sort(dumps.begin(), dumps.end());  // the names carry the time: oldest first
+    for (size_t i = 0; i + kKeep < dumps.size(); i++) std::filesystem::remove(dumps[i], ec);
+}
+
+// once, and not under a debugger: otherwise the window just vanishes and the player has no idea what to send
+void TellPlayerAboutCrash() {
+    static std::atomic<bool> told{false};
+    if (IsDebuggerPresent() || told.exchange(true)) return;
+    std::wstring text = L"The game stopped because of an error.\n\nTo report it, send logs\\" +
+                        std::filesystem::path(logx::Path()).filename().wstring() +
+                        L" and the newest file in CrashDumps, both in the game's folder.";
+    MessageBoxW(nullptr, text.c_str(), kGame.short_title, MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
 // crash dump in CrashDumps beside the exe
 LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
     // the dump holds no guest memory: the guest registers and return addresses go to the log
@@ -57,14 +81,17 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
     swprintf(name, 64, L"%ls.%04u.%02u.%02u_%02u.%02u.%02u.dmp", kGame.name, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
              t.wSecond);
     HANDLE f = CreateFileW((dir / name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
-    MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), e, FALSE};
-    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
-                      MINIDUMP_TYPE(MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo |
-                                    MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory),
-                      e ? &info : nullptr, nullptr, nullptr);
-    CloseHandle(f);
+    if (f != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), e, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                          MINIDUMP_TYPE(MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo |
+                                        MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory),
+                          e ? &info : nullptr, nullptr, nullptr);
+        CloseHandle(f);
+        PruneCrashDumps(dir);
+    }
     logx::Flush();
+    TellPlayerAboutCrash();
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -243,6 +270,13 @@ void Pace() {
 }  // namespace app
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    // the exe and the game code it builds target x86-64-v2: an older processor would stop at the first SSE4.2 or
+    // POPCNT instruction without a word
+    if (int r[4] = {}; __cpuid(r, 1), !(r[2] & (1 << 20)) || !(r[2] & (1 << 23))) {
+        MessageBoxW(nullptr, L"This game needs a processor with SSE4.2 and POPCNT: Intel from 2008 or AMD from 2011 on.",
+                    app::kGame.short_title, MB_ICONERROR);
+        return 1;
+    }
     SetUnhandledExceptionFilter(app::WriteCrashDump);
     std::signal(SIGABRT, [](int) { app::WriteCrashDump(nullptr); });
     timeBeginPeriod(1);
