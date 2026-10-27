@@ -97,9 +97,50 @@ constexpr uint32_t kDevicePtr = SYM(D3D_pDevice);
 constexpr uint32_t kIndexData = SYM(D3D_IndexData);  // index data base the inline draws read
 constexpr uint32_t kDirtyFlags = SYM(D3D_DirtyFlags);
 constexpr uint32_t kTextureState = SYM(D3D_DeferredTextureState);  // [4][32]
-constexpr uint32_t kRenderState = SYM(D3D_RenderState);            // [166]
+constexpr uint32_t kRenderState = SYM(D3D_RenderState);            // [kGuestRsCount]
 constexpr uint32_t kStreams = SYM(D3D_Streams);                    // [16] stride, offset, buffer
 constexpr uint32_t kSimpleEncode = SYM(D3D_SimpleRenderStateEncode);
+
+// D3DRS numbering: the renderer keeps the XDK 4831 and 5849 one; a title built with XDK 4134 numbers its states
+// without the SIMPLE_UNUSED, DEPTHCLIPCONTROL, STIPPLEENABLE, PRESENTATIONINTERVAL, DEFERRED_UNUSED and SAMPLEALPHA
+// slots (Cxbx-Reloaded's DxbxRenderStateInfo versions; JSRF's SetRenderStateNotInline 0x18F425 has 82 simple states)
+#if defined(XDK_D3DRS_Numbering) && XDK_D3DRS_Numbering == 4134
+constexpr uint32_t kGuestRsCount = 146;
+constexpr uint8_t kGuestRsOf[gpu::kRsMax] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+    80, 81, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 82, 83, 84, 85,
+    86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101,
+    102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 117, 118, 119, 120, 121, 122, 123, 124,
+    125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 255, 139,
+    140, 141, 142, 143, 144, 145,
+};
+#else
+constexpr uint32_t kGuestRsCount = gpu::kRsMax;
+#endif
+// the title's index of a state the renderer numbers rs, or kNoGuestRs when its XDK has none
+constexpr uint32_t kNoGuestRs = 0xFFFFFFFFu;
+constexpr uint32_t GuestRs(uint32_t rs) {
+#if defined(XDK_D3DRS_Numbering) && XDK_D3DRS_Numbering == 4134
+    return rs < gpu::kRsMax && kGuestRsOf[rs] != 0xFF ? kGuestRsOf[rs] : kNoGuestRs;
+#else
+    return rs;
+#endif
+}
+// the renderer's index of the title's state guest, or kNoGuestRs past the title's table
+inline uint32_t HostRs(uint32_t guest) {
+#if defined(XDK_D3DRS_Numbering) && XDK_D3DRS_Numbering == 4134
+    for (uint32_t rs = 0; rs < gpu::kRsMax; rs++)
+        if (kGuestRsOf[rs] == guest) return rs;
+    return kNoGuestRs;
+#else
+    return guest < gpu::kRsMax ? guest : kNoGuestRs;
+#endif
+}
 
 // CDevice fields mirrored so the recompiled getters and resource code see what the XDK would
 constexpr uint32_t kDevPush = XDK_CDevice_Push, kDevThreshold = XDK_CDevice_PushThreshold,
@@ -202,7 +243,8 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
 
 void SyncDeferred() {
     // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
-    for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
+    for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++)
+        if (uint32_t g = GuestRs(i); g != kNoGuestRs) g_state.rs[i] = R32(kRenderState + g * 4);
     for (int s = 0; s < 4; s++)
         for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
 }
@@ -237,7 +279,7 @@ void UpdateViewportConstants() {
 
 void SetComplex(uint32_t rs, uint32_t v) {
     g_state.rs[rs] = v;
-    W32(kRenderState + rs * 4, v);
+    if (uint32_t g = GuestRs(rs); g != kNoGuestRs) W32(kRenderState + g * 4, v);
 }
 
 // The library's default render and texture stage states; its pushes land in the scratch buffer
@@ -687,11 +729,11 @@ HLE_FASTCALL(D3DDevice_SetRenderState_Simple, 0) {
 }
 
 HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
-    uint32_t rs = a[0], v = a[1];
+    uint32_t guest = a[0], v = a[1], rs = HostRs(guest);
     if (rs < gpu::kRsDeferredFirst) {
-        uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
+        uint32_t method = R32(kSimpleEncode + guest * 4) & 0x1FFC;
         g_state.simple[method >> 2] = v;
-        W32(kRenderState + rs * 4, v);  // titles read their states back from the library's table
+        W32(kRenderState + guest * 4, v);  // titles read their states back from the library's table
     } else if (rs < gpu::kRsMax) {
         SetComplex(rs, v);
     }
@@ -1263,7 +1305,32 @@ void EndPrimitive() {
     uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
     g_im_prim = 0;
     if (!prim || !count) return;
-    if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");
+    // the fixed pipeline (an FVF, pretransformed or not): the slots packed in the FVF's own layout and drawn as
+    // DrawVerticesUP would, colours back to D3DCOLOR from the bytes the walk spread (XDK 4134 titles draw text so)
+    if (!(handle & 1)) {
+        static std::vector<uint8_t> fvf_data;
+        gpu::VertexShader fvf;
+        gpu::FvfInputs(handle, fvf);
+        uint32_t stride = fvf.stream_stride[0];
+        if (!stride) return;
+        fvf_data.assign(size_t(count) * stride, 0);
+        for (uint32_t v = 0; v < count; v++)
+            for (uint32_t r = 0; r < 16; r++) {
+                const auto& in = fvf.inputs[r];
+                if (!in.type) continue;
+                const float* src = &g_im_vertices[v * 64 + r * 4];
+                uint8_t* dst = &fvf_data[size_t(v) * stride + in.offset];
+                if (in.type == 0x40) {
+                    uint32_t c = 0;
+                    for (int k = 0; k < 4; k++) c |= uint32_t(std::clamp(src[k], 0.0f, 1.0f) * 255.0f + 0.5f) << (k * 8);
+                    std::memcpy(dst, &c, 4);
+                } else {
+                    std::memcpy(dst, src, (in.type >> 4) * 4);
+                }
+            }
+        DrawUp(prim, count, fvf_data.data(), stride);
+        return;
+    }
     auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
     Made& m = made[{from.get(), g_im_mask}];
     if (!m.vs) {

@@ -788,6 +788,52 @@ HLE_STDCALL(DirectSoundCreate, 3) {
     return 0;
 }
 HLE_STDCALL(IDirectSound_Release, 1) { return 0; }
+#ifdef HAS_IDirectSound_AddRef
+// XDK 4134 titles reach the device's AddRef through this export (DirectMusic-style QueryInterface in the title)
+HLE_STDCALL(IDirectSound_AddRef, 1) { return 1; }
+#endif
+#ifdef HAS_IDirectSound_GetCaps
+// (this, DSCAPS): free 2D and 3D voices, free buffer SGEs, memory allocated
+HLE_STDCALL(IDirectSound_GetCaps, 2) {
+    W32(a[1], 256 - 64);
+    W32(a[1] + 4, 64);
+    W32(a[1] + 8, 2047);
+    W32(a[1] + 12, 0);
+    return 0;
+}
+#endif
+// XDK 4134 buffer methods the host mixer keeps no state for: AddRef, cones, 3D mode and listener factors
+#ifdef HAS_IDirectSoundBuffer_AddRef
+HLE_STDCALL(IDirectSoundBuffer_AddRef, 1) { return 1; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetLFO
+HLE_STDCALL(IDirectSoundBuffer_SetLFO, 2) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetConeAngles
+HLE_STDCALL(IDirectSoundBuffer_SetConeAngles, 4) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetConeOrientation
+HLE_STDCALL(IDirectSoundBuffer_SetConeOrientation, 5) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetConeOutsideVolume
+HLE_STDCALL(IDirectSoundBuffer_SetConeOutsideVolume, 3) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetDistanceFactor
+HLE_STDCALL(IDirectSoundBuffer_SetDistanceFactor, 3) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetDopplerFactor
+HLE_STDCALL(IDirectSoundBuffer_SetDopplerFactor, 3) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetMode
+HLE_STDCALL(IDirectSoundBuffer_SetMode, 3) { return 0; }
+#endif
+#ifdef HAS_IDirectSoundBuffer_SetRolloffFactor
+HLE_STDCALL(IDirectSoundBuffer_SetRolloffFactor, 3) { return 0; }
+#endif
+#ifdef HAS_IDirectSound_SetAllParameters
+// (this, DS3DLISTENER, apply): the host mixer has no 3D listener
+HLE_STDCALL(IDirectSound_SetAllParameters, 3) { return 0; }
+#endif
 HLE_STDCALL(DirectSoundUseFullHRTF, 0) { return 0; }
 HLE_STDCALL(DirectSoundUseLightHRTF, 0) { return 0; }
 HLE_STDCALL(IDirectSound_GetSpeakerConfig, 2) {
