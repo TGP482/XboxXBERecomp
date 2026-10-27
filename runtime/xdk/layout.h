@@ -96,6 +96,9 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_CDevice_VertexShader
 #define XDK_CDevice_VertexShader 0xFFFFFFFFu
 #endif
+#ifndef XDK_CDevice_Reports
+#define XDK_CDevice_Reports 0xFFFFFFFFu
+#endif
 #ifndef XDK_CDevice_BackBufferScale
 #define XDK_CDevice_BackBufferScale 0xFFFFFFFFu
 #endif

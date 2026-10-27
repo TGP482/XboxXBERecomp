@@ -675,8 +675,27 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
     return k;
 }
 
+constexpr uint32_t kMuxInput = 2;
 constexpr uint32_t kMuxConstant = 3;
 constexpr uint32_t kViewportOffsetConstant = 59;  // c-37: constants start at c-96
+
+bool TexcoordsFromInputs(const std::vector<uint32_t>& prog) {
+    constexpr uint32_t kMacMov = 1, kMacArl = 13, kIluMov = 1, kOutT0 = 9, kOutT3 = 12;
+    for (size_t n = 0; n + 4 <= prog.size(); n += 4) {
+        Tok k{&prog[n]};
+        uint32_t mac = k.f(1, 21, 4), ilu = k.f(1, 25, 3), out = k.f(3, 3, 8) & 0xF;
+        bool use_ilu = k.f(3, 2, 1) == 1;
+        bool writes = k.f(3, 12, 4) && k.f(3, 11, 1) && ((use_ilu && ilu) || (!use_ilu && mac && mac != kMacArl));
+        if (writes && out >= kOutT0 && out <= kOutT3) {
+            // the mac's mov reads operand A, the ilu's operand C; negated or from anything but an input, it computes
+            bool plain = use_ilu ? ilu == kIluMov && k.f(3, 28, 2) == kMuxInput && !k.f(2, 10, 1)
+                                 : mac == kMacMov && k.f(2, 26, 2) == kMuxInput && !k.f(1, 8, 1);
+            if (!plain) return false;
+        }
+        if (k.f(3, 0, 1)) break;  // last instruction
+    }
+    return true;
+}
 
 bool ReadsViewportOffset(const std::vector<uint32_t>& prog) {
     for (size_t n = 0; n + 4 <= prog.size(); n += 4) {

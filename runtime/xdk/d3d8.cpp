@@ -482,6 +482,23 @@ HLE_STDCALL(D3D_KickOffAndWaitForIdle, 0) {
 }
 HLE_FASTCALL(CDevice_KickOff, 0) { return 0; }
 
+#if HAS_D3DDevice_GetVisibilityTestResult
+// (index, result, timestamp): a title may poll a test it has just ended, with no present in between (Ratatouille's
+// loading screen spins on one). The console's GPU writes the report by itself; here the commands pushed since the last
+// draw are read and the renderer is flushed, which writes every report it is past, before the library's code reads it.
+HLE_WRAP(D3DDevice_GetVisibilityTestResult, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_backend) return;
+    if constexpr (XDK_CDevice_Reports != xdk::kUnknown) {
+        constexpr uint32_t kReportBytes = 16, kStatus = 12, kPending = 0xFFFFFFFF;
+        uint32_t page = Dev(XDK_CDevice_Reports + (a[0] >> 8) * 4);
+        if (!page || R32(page + (a[0] & 0xFF) * kReportBytes + kStatus) != kPending) return;
+    }
+    Walk(Dev(kDevPush));
+    g_backend->Flush();
+}
+#endif
+
 HLE_STDCALL(D3DDevice_MakeSpace, 0) {
     LOG_FIRST(16, "d3d: MakeSpace from %08X, some caller still pushes hardware commands", R32(ctx.esp));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
