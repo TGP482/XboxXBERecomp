@@ -2872,7 +2872,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
-        EndDrawCapture(s, a, count, c);
+        // XBE_CAPTURE_VS=<handle in hex>: that shader's draws also get their layout, first vertices and constants
+        static const uint32_t detail_vs = [] {
+            const char* v = std::getenv("XBE_CAPTURE_VS");
+            return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u;
+        }();
+        if (detail_vs && s.vs_handle == detail_vs) {
+            fputs(DescribeVertices(s, start, count, indices, 6).c_str(), cap_);
+            CaptureInputs(s, a, c);
+            fputc('\n', cap_);
+        } else {
+            EndDrawCapture(s, a, count, c);
+        }
         CaptureShaders(s, a, sh, pk);
     }
 

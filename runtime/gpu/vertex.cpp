@@ -1,6 +1,7 @@
 #include "gpu/vertex.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 #include <dxgiformat.h>
@@ -438,6 +439,38 @@ void FvfInputs(uint32_t fvf, VertexShader& vs) {
     for (uint32_t i = 0; i < tex && i < 4; i++) add(int(9 + i), kTexType[(fvf >> (16 + i * 2)) & 3]);
     vs.stream_stride.fill(0);
     vs.stream_stride[0] = off;
+}
+
+std::string DescribeVertices(const State& s, uint32_t start, uint32_t count, const uint8_t* ip, uint32_t max_vertices) {
+    using namespace kernel;
+    VertexShader fvf_layout;
+    const VertexShader* layout = PickLayout(s, fvf_layout);
+    std::string out;
+    if (!layout) return out;
+    char b[160];
+    DrawRange d;
+    d.start = start;
+    d.count = count;
+    d.ip = ip;
+    for (int r = 0; r < 16; r++) {
+        const auto& in = layout->inputs[size_t(r)];
+        if (in.stream < 0 || !in.type) continue;
+        const auto& st = s.streams[size_t(in.stream)];
+        uint32_t stride = StrideOf(s, *layout, in);
+        std::snprintf(b, sizeof b, "\n     v%d stream %d offset %u type %02X stride %u vb %08X:", r, in.stream, in.offset,
+                      in.type, stride, st.vb);
+        out += b;
+        if (!st.vb || in.type == kTypeNone) continue;
+        uint32_t data = mem::VirtualFromPhysical(R32(st.vb + kResData));
+        const uint8_t* src = static_cast<const uint8_t*>(HostPtr(data + in.offset));
+        for (uint32_t i = 0; i < std::min(count, max_vertices); i++) {
+            float f[4];
+            Convert(in.type, src + size_t(DrawVertex(s, d, i)) * stride, f);
+            std::snprintf(b, sizeof b, " (%g %g %g %g)", f[0], f[1], f[2], f[3]);
+            out += b;
+        }
+    }
+    return out;
 }
 
 bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out) {
