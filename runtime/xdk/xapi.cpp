@@ -1,5 +1,6 @@
 // XAPI functions that talk to hardware: controller ports and the hard disk cache partition
 #include <chrono>
+#include <filesystem>
 
 #include "core/input.h"
 #include "xdk/hle.h"
@@ -44,7 +45,17 @@ std::unordered_map<uint32_t, Handle> g_handles;
 
 }  // namespace
 
+// fFormatClean (the xbe's FormatUtilityDrive init flag) asks for an empty cache partition at every start, and the
+// title counts on it: a file left by a run that ended while writing it, a crash or a closed window, would otherwise
+// be read back as the title's own
 HLE_STDCALL(XMountUtilityDrive, 1) {
+    if (a[0]) {
+        namespace fs = std::filesystem;
+        fs::path z = ResolvePath("\\Device\\Harddisk0\\Partition5", 0);
+        std::error_code ec;
+        if (z.filename() == "Z")  // never anything but the cache partition's own folder
+            for (auto& e : fs::directory_iterator(z, ec)) fs::remove_all(e.path(), ec);
+    }
     CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");
     return 1;
 }
