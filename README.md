@@ -5,6 +5,7 @@ A tool for creating unofficial native PC ports of original Xbox games. Games are
 This tool was originally created for porting [Tom Clancy's Splinter Cell: Double Agent](https://github.com/TGP482/SCDoubleAgent-XBERecomp) and was later used to port:
 - [BLACK](https://github.com/TGP482/BLACK-XBERecomp)
 - [007: From Russia With Love](https://github.com/TGP482/007FRWL-XBERecomp)
+- [007: Nightfire](https://github.com/TGP482/007Nightfire-XBERecomp)
 
 > [!NOTE]
 > This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build.
