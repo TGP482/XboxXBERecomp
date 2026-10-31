@@ -229,7 +229,11 @@ public:
     void WaitFence(uint32_t fence) override { Wait(fence, WaitFor::Fence, "fence"); }
     bool Busy(uint32_t resource) override {
         auto it = last_use_.find(resource);
-        return it != last_use_.end() && it->second > done_.load();
+        if (it == last_use_.end()) return false;
+        // used by the batch still being recorded: send it, as the console's IsBusy kicks the push buffer off, or a
+        // title polling a resource between frames (a loading screen) waits for a batch nothing else will send
+        if (it->second >= cur_->id) Submit();
+        return it->second > done_.load();
     }
     void WaitResource(uint32_t resource) override {
         auto it = last_use_.find(resource);
