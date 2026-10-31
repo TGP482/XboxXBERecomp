@@ -26,6 +26,22 @@ std::atomic<uint32_t> g_next_id{0x10};
 constexpr uint32_t kKpcrSize = 0x400;
 constexpr uint32_t kEthreadSize = 0x200;
 
+// the one KPROCESS every thread's ApcState.Process points at; XAPI's XSetProcessQuantumLength and
+// XGetProcessQuantumLength keep the quantum in its ThreadQuantum, in thirds of a millisecond
+uint32_t ProcessBlock() {
+    static const uint32_t process = [] {
+        uint32_t p = mem::AllocSystem(0x40, 16);
+        W32(p + 0x00, p);         // ReadyListHead, empty
+        W32(p + 0x04, p);
+        W32(p + 0x08, p + 0x08);  // ThreadListHead, empty
+        W32(p + 0x0C, p + 0x08);
+        W32(p + 0x14, 60);        // ThreadQuantum: the console's 20 ms
+        G<int8_t>(p + 0x18) = 8;  // BasePriority, normal
+        return p;
+    }();
+    return process;
+}
+
 void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     stack_size = std::max<uint32_t>(stack_size, 0x10000);
     tls_size = (tls_size + 3) & ~3u;
@@ -50,6 +66,11 @@ void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     W32(e + 0x1C, t.stack_top);                 // KTHREAD.StackBase
     W32(e + 0x20, t.stack_top - stack_size);    // KTHREAD.StackLimit
     W32(e + 0x28, t.tls);                       // KTHREAD.TlsData
+    W32(e + 0x34, e + 0x34);                    // KTHREAD.ApcState.ApcListHead[KernelMode], empty
+    W32(e + 0x38, e + 0x34);
+    W32(e + 0x3C, e + 0x3C);                    // ApcListHead[UserMode], empty
+    W32(e + 0x40, e + 0x3C);
+    W32(e + 0x44, ProcessBlock());              // KTHREAD.ApcState.Process
     W32(e + 0x12C, t.id);                       // ETHREAD.UniqueThread
 }
 
