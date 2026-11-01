@@ -51,8 +51,11 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
 
 const std::string& Path() { return g_path; }
 
+// XBE_VERBOSE set: a release build writes Info and Warn lines too
+static const bool g_verbose_env = std::getenv("XBE_VERBOSE") != nullptr;
+
 void Write(Level lv, const char* fmt, ...) {
-    if (!kVerbose && lv < Level::Error) return;
+    if (!kVerbose && lv < Level::Error && !(g_verbose_env && lv >= Level::Info)) return;
     char msg[4096];
     va_list ap;
     va_start(ap, fmt);

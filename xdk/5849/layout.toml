@@ -21,6 +21,7 @@ CDevice_Size          = 0x24A0  # Direct3D_CreateDevice 0x49D28B clears 0x928 dw
 CDevice_Flags             = 0x8    # Direct3D_CreateDevice 0x49D263 ors BehaviorFlags & 0x10 into it (0x4AB678), D3DDevice_SetPixelShader 0x4A5DB1 tests that bit
 CDevice_Time              = 0x2C   # D3D_KickOffAndWaitForIdle 0x4A17A5 passes it to D3D_BlockOnTime, D3D_SetFence 0x4A1475 adds 2
 CDevice_PixelShader       = 0x784  # D3DDevice_SetPixelShader 0x4A5CE8 stores the handle
+CDevice_Reports           = 0x7D4  # visibility test report pages, 256 reports of 16 bytes each: Ratatouille's D3DDevice_GetVisibilityTestResult 0x2CA5B5 reads [index >> 8], EndVisibilityTest's slot helper 0x2CB03E allocates it, the device teardown 0x2D1D2F frees 0x40 of them
 CDevice_VertexShader      = 0x794  # the device init 0x4A261B stores the FVF shader object 0x4ADCE8, D3DDevice_SetVertexShader 0x49EEAE the current one
 CDevice_BackBufferScale   = 0x96C  # the frame buffer init 0x4A1D4B stores the X scale as a float, 0x4A1D64 the Y scale at +4
 CDevice_Viewport          = 0xEE0  # D3DDevice_SetViewport 0x49B040 to 0x49B06C stores X, Y, Width, Height, MinZ, MaxZ

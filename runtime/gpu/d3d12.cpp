@@ -997,7 +997,11 @@ void D3D12Backend::Submit(bool wait) {
     }
 }
 
-void D3D12Backend::Flush() { Submit(true); }
+// the GPU is idle after it: every report asked for so far is written
+void D3D12Backend::Flush() {
+    Submit(true);
+    DeliverReports();
+}
 
 void D3D12Backend::WaitFence(uint64_t value) {
     fence_->SetEventOnCompletion(value, event_);
@@ -2585,6 +2589,19 @@ bool AnyStageWraps(const State& s) {
     return false;
 }
 
+// UnitTexcoords reads the vertices, so it only holds where the vertex stage hands their coordinates on unchanged: no
+// texture coordinate generation or transform in the fixed function pipeline, plain movs in a program. Ratatouille's
+// characters and pickups shift theirs by -1 through a texture matrix in constants, which only wrapping undoes; clamped,
+// they drew in one colour, their texture's corner texel.
+bool CoordinatesPassedOn(const State& s, bool pretransformed) {
+    if ((s.vs_handle & 1) && s.vs && !s.vs->program.empty()) return TexcoordsFromInputs(s.vs->program);
+    if (pretransformed) return true;
+    FixedKey f = MakeFixedKey(s);
+    for (uint32_t u : f.tex)
+        if ((u >> 4 & 7) || (u >> 8 & 7)) return false;  // texgen, D3DTTFF count
+    return true;
+}
+
 // the first slot of the stages' four views, made only when this frame has not made the same set yet
 uint32_t D3D12Backend::EnsureViewSet(const DrawTextures& stages) {
     if (view_sets_frame_ != frame_) {
@@ -2612,7 +2629,8 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
     uint32_t views = EnsureViewSet(stages);
     if (views != binds_.views) cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
     binds_.views = views;
-    uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
+    uint32_t samplers =
+        EnsureStageSamplers(s, stages, AnyStageWraps(s) && CoordinatesPassedOn(s, a.pretransformed) && UnitTexcoords(a));
     if (samplers != binds_.samplers) cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
     binds_.samplers = samplers;
 }
@@ -2854,7 +2872,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
-        EndDrawCapture(s, a, count, c);
+        // XBE_CAPTURE_VS=<handle in hex>: that shader's draws also get their layout, first vertices and constants
+        static const uint32_t detail_vs = [] {
+            const char* v = std::getenv("XBE_CAPTURE_VS");
+            return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u;
+        }();
+        if (detail_vs && s.vs_handle == detail_vs) {
+            fputs(DescribeVertices(s, start, count, indices, 6).c_str(), cap_);
+            CaptureInputs(s, a, c);
+            fputc('\n', cap_);
+        } else {
+            EndDrawCapture(s, a, count, c);
+        }
         CaptureShaders(s, a, sh, pk);
     }
 

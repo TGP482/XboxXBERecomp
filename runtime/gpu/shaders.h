@@ -46,6 +46,9 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]);
 std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0);
 // the program reads c-37, the viewport offset that carries the XDK's half pixel screen space offset
 bool ReadsViewportOffset(const std::vector<uint32_t>& program);
+// every texture coordinate the program writes (oT0 to oT3) is a plain mov of an input register: the sampler gets the
+// vertices' own coordinates. False when one is computed, as by a texture matrix in constants.
+bool TexcoordsFromInputs(const std::vector<uint32_t>& program);
 // fixed function vertex state a shader is built for
 struct FixedKey {
     uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:

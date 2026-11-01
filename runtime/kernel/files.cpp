@@ -587,21 +587,27 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
     return kSuccess;
 }
 
+// Volume size in 16 KiB clusters (32 sectors of 512 bytes), each in bytes under 2 GiB: titles keep the byte counts
+// GetDiskFreeSpaceEx returns in 32 bits, signed or not. Ratatouille takes the free bytes' low dword alone (0x201DBE),
+// so the 8 GiB reported before read as no space and it refused to save; the console's own E: is under 5 GB.
+constexpr uint64_t kVolumeClusters = 0x1FFFE;  // just under 2 GiB
+constexpr uint64_t kFreeClusters = 0x1FFFC;    // 2 GiB less 64 KiB, the title's saves are never near it
+
 KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
     uint32_t iosb = a[1], out = a[2], len = a[3], cls = a[4];
     std::memset(HostPtr(out), 0, len);
     switch (cls) {
-        case 3:  // FileFsSizeInformation: 16 GiB total, 8 GiB free in 16 KiB units
-            W64(out, 0x100000);
-            W64(out + 8, 0x80000);
+        case 3:  // FileFsSizeInformation
+            W64(out, kVolumeClusters);
+            W64(out + 8, kFreeClusters);
             W32(out + 0x10, 32);
             W32(out + 0x14, 512);
             IoStatus(iosb, kSuccess, 0x18);
             return kSuccess;
         case 7:  // FileFsFullSizeInformation
-            W64(out, 0x100000);
-            W64(out + 8, 0x80000);
-            W64(out + 0x10, 0x80000);
+            W64(out, kVolumeClusters);
+            W64(out + 8, kFreeClusters);
+            W64(out + 0x10, kFreeClusters);
             W32(out + 0x18, 32);
             W32(out + 0x1C, 512);
             IoStatus(iosb, kSuccess, 0x20);
