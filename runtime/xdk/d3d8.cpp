@@ -80,6 +80,9 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #ifndef SYM_D3D_BlockOnNonSurfaceResource
 #define SYM_D3D_BlockOnNonSurfaceResource FFFFFE0A
 #define HAS_D3D_BlockOnNonSurfaceResource 0
+#ifndef SYM_D3DDevice_DrawIndexedVerticesUP
+#define SYM_D3DDevice_DrawIndexedVerticesUP FFFFFE0C
+#define HAS_D3DDevice_DrawIndexedVerticesUP 0
 #endif
 
 namespace d3d {
@@ -1224,12 +1227,14 @@ uint32_t UpVertices(const void* src, uint32_t bytes) {
     return g_up_header;
 }
 
-void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride) {
+void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride, const uint16_t* indices = nullptr) {
     if (!g_backend || !count || !stride) return;
     SyncDeferred();
+    // indexed: count is of indices, the ring takes the vertices up to the highest one
+    uint32_t used = indices ? *std::max_element(indices, indices + count) + 1u : count;
     auto stream = g_state.streams[0];
-    g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
-    g_backend->Draw(g_state, prim, 0, count, nullptr);
+    g_state.streams[0] = {UpVertices(vertices, used * stride), stride};
+    g_backend->Draw(g_state, prim, 0, count, reinterpret_cast<const uint8_t*>(indices));
     g_state.streams[0] = stream;
 }
 
@@ -1395,6 +1400,13 @@ HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
+    return 0;
+}
+// (prim, index count, 16 bit indices, vertices, stride)
+HLE_STDCALL(D3DDevice_DrawIndexedVerticesUP, 5) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));
+    DrawUp(a[0], a[1], HostPtr(a[3]), a[4], static_cast<const uint16_t*>(HostPtr(a[2])));
     return 0;
 }
 
