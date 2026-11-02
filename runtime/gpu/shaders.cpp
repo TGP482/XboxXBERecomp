@@ -971,10 +971,10 @@ std::string QuadHlsl(std::string s) {
 namespace {
 
 // A w buffer's reversed depth comes from the clip w alone, zparams.x * (zparams.y / w - 1), exact where z / w had
-// already rounded away; a z buffer's is 1 - z. zparams.z is the polygon offset in the units of each
-const char* kReversedClipHlsl = R"(float ReversedClip(float z, float w) {
+// already rounded away; a z buffer's is 1 - z, given as w - z. zparams.z is the polygon offset in the units of each
+const char* kReversedClipHlsl = R"(float ReversedClip(float wz, float w) {
     if (zparams.x != 0) return zparams.x * (zparams.y - (w + zparams.z));
-    return w - z - zparams.z * w;
+    return wz - zparams.z * w;
 }
 )";
 
@@ -990,8 +990,12 @@ bool InsertAfter(std::string& s, const char* at, const char* text) {
 std::string ReversedDepthHlsl(std::string s) {
     size_t entry = s.find("VOut main(");
     if (entry != std::string::npos) s.insert(entry, kReversedClipHlsl);
-    InsertAfter(s, "    o.pos = q;\n", "    o.pos.z = ReversedClip(q.z, q.w);\n");
-    InsertAfter(s, "    o.pos = cp;\n", "    o.pos.z = ReversedClip(cp.z, cp.w);\n");
+    InsertAfter(s, "    o.pos = q;\n", "    o.pos.z = ReversedClip(q.w - q.z, q.w);\n");
+    // w and z rounded apart lose the near plane's offset to cancellation once the far plane is distant, so fixed
+    // function takes w - z from one column; the matrix's own rounding then moves every surface alike
+    InsertAfter(s, "    o.pos = cp;\n",
+                "    precise float wz = dot(ip, wvp._m03_m13_m23_m33 - wvp._m02_m12_m22_m32);\n"
+                "    o.pos.z = ReversedClip(wz, cp.w);\n");
     return s;
 }
 
