@@ -286,6 +286,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ImGui_ImplWin32_Init(app::g_hwnd);
 
     input::Init();
+    app::SetTitleIcon(app::g_hwnd, game.xbe);
     if (app::kGame.window) app::kGame.window(app::g_hwnd);
     std::wstring hdd = app::Instance() > 1 ? L"hdd" + std::to_wstring(app::Instance()) : L"hdd";
     if (app::Instance())
