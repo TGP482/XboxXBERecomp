@@ -174,7 +174,7 @@ bool Analysis::SledTable(uint32_t jmp_va, const uint32_t* ring, int nring, JumpT
     return !jt.targets.empty();
 }
 
-bool Analysis::Walk(uint32_t entry, bool trusted, std::vector<uint32_t>* calls) {
+bool Analysis::Walk(uint32_t entry, bool trusted, std::vector<uint32_t>* calls, bool overlap) {
     struct Pending {
         uint32_t va;
         Insn insn;
@@ -208,7 +208,7 @@ bool Analysis::Walk(uint32_t entry, bool trusted, std::vector<uint32_t>* calls) 
                 if (trusted) break;
                 return false;
             }
-            if (cover_[va - lo_] != 0 && (!trusted || cover_[va - lo_] == 3)) {
+            if (cover_[va - lo_] != 0 && ((!trusted && !overlap) || cover_[va - lo_] == 3)) {
                 if (trusted) break;
                 return false;
             }
@@ -228,7 +228,7 @@ bool Analysis::Walk(uint32_t entry, bool trusted, std::vector<uint32_t>* calls) 
                 bool data = false;
                 for (uint32_t i = 0; i < insn.len; i++)
                     data |= !(i && InTail(va + i)) && (!IsCode(va + i) || cover_[va + i - lo_] == 3);
-                if (!trusted) return false;
+                if (!trusted && (!overlap || data)) return false;
                 if (data) break;
             }
             local.push_back({va, insn});
@@ -508,7 +508,8 @@ void Analysis::Run() {
     std::fprintf(stderr, "direct: %zu functions, %zu instructions\n", functions.size(), insns_.size());
     if (cfg.pointer_seeds) SeedPointers();
     if (cfg.gap_fill) GapFill();
-    // immediates that point at code are callbacks: make sure they are entries
+    // immediates that point at code are callbacks: make sure they are entries. A pointer seed or gap fill guess
+    // decoded across one's body first does not disqualify it.
     size_t imm = 0;
     std::vector<uint32_t> extra;
     for (auto& [va, insn] : insns_) {
@@ -533,7 +534,7 @@ void Analysis::Run() {
             imm++;
         } else if (cov == 0) {
             std::vector<uint32_t> calls;
-            if (Walk(v, false, &calls)) {
+            if (Walk(v, false, &calls, true)) {
                 functions.insert(v);
                 imm++;
                 Adopt(calls, false);
