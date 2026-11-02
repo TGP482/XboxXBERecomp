@@ -80,6 +80,11 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #ifndef SYM_D3D_BlockOnNonSurfaceResource
 #define SYM_D3D_BlockOnNonSurfaceResource FFFFFE0A
 #define HAS_D3D_BlockOnNonSurfaceResource 0
+#endif
+#ifndef SYM_D3DDevice_SetBackBufferScale
+#define SYM_D3DDevice_SetBackBufferScale FFFFFE0B
+#define HAS_D3DDevice_SetBackBufferScale 0
+#endif
 #ifndef SYM_D3DDevice_DrawIndexedVerticesUP
 #define SYM_D3DDevice_DrawIndexedVerticesUP FFFFFE0C
 #define HAS_D3DDevice_DrawIndexedVerticesUP 0
@@ -131,6 +136,10 @@ std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
 std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
 uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
+// the console's frame buffers are the multisample factor times the asked size, and after SetBackBufferScale it draws
+// to only their top-left part; CopyRects blits those pixels as they lie
+uint32_t g_ms_x = 1, g_ms_y = 1;
+float g_bb_x = 1, g_bb_y = 1;
 uint32_t g_scratch_push = 0, g_scratch_size = 0;
 uint32_t g_walk = 0;  // first scratch command not read yet
 
@@ -267,6 +276,9 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
     uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
     if (!w) w = 640;
     if (!h) h = 480;
+    uint32_t ms = R32(pp + 0x10);  // D3DMULTISAMPLE_TYPE: samples across in bits 4-7, down in bits 0-3
+    g_ms_x = std::max<uint32_t>(ms >> 4 & 0xF, 1);
+    g_ms_y = std::max<uint32_t>(ms & 0xF, 1);
     LOGI("d3d: %s %ux%u format %X buffers %u depth %u format %X interval %X flags %X", caller, w, h, fmt, count,
          auto_depth, depth_fmt, interval, R32(pp + 0x28));
     uint32_t color_fmt = gpu::LinearColorFormat(fmt);
@@ -517,6 +529,14 @@ HLE_STDCALL(D3DDevice_GetRasterStatus, 1) {
 }
 HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }
 HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }
+// (x, y): the console draws to a scaled-down part of the back buffer and enlarges it on display; the host draws
+// every frame at its own render scale, and only a copy out of the back buffer places it as the console would
+HLE_STDCALL(D3DDevice_SetBackBufferScale, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_bb_x = ArgF(a, 0);
+    g_bb_y = ArgF(a, 1);
+    return 0;
+}
 HLE_STDCALL(D3DDevice_EnableOverlay, 1) { return 0; }
 // the front buffer, read back at the guest size, is kept for the next instance after a quick reboot, which may
 // fade from it at its first frames
@@ -663,7 +683,9 @@ HLE_STDCALL(D3DDevice_Reset, 1) {
 
 HLE_STDCALL(D3DDevice_CopyRects, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (g_backend) g_backend->Copy(SurfaceOf(a[0]), SurfaceOf(a[3]), a[2], a[1], a[4]);
+    bool frame = std::find(g_buffers.begin(), g_buffers.end(), a[0]) != g_buffers.end();
+    float kx = frame ? g_ms_x * g_bb_x : 1, ky = frame ? g_ms_y * g_bb_y : 1;
+    if (g_backend) g_backend->Copy(SurfaceOf(a[0]), SurfaceOf(a[3]), a[2], a[1], a[4], kx, ky);
     return 0;
 }
 

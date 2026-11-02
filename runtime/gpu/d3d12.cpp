@@ -458,7 +458,8 @@ public:
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
-    void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
+    void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points,
+              float src_kx, float src_ky) override;
     void Present(const Surface& front) override;
     void WaitGpuFrame(uint64_t n) override;
     void Sync(uint32_t data, uint32_t size) override;
@@ -674,6 +675,7 @@ private:
         uint32_t count;
         uint32_t src_rects;
         uint32_t dst_points;
+        float kx = 1, ky = 1;  // Copy's src_kx, src_ky
     };
     void CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D12_RESOURCE_STATES& src_state, Target& dst_t,
                     const CopyList& l);
@@ -3048,13 +3050,14 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
     Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
-    float src_scale = float(src_t.w) / src_t.gw;
+    float gw = src_t.gw * l.kx, gh = src_t.gh * l.ky;  // the source in the guest pixels the rects use
+    float src_scale = float(src_t.w) / gw;
     float dst_scale = float(dst_t.w) / dst_t.gw;
     bool listed = l.count && l.src_rects;
     uint32_t n = listed ? l.count : 1;
     for (uint32_t i = 0; i < n; i++) {
-        float whole_w = float(std::min(src_t.gw, dst_t.gw));
-        float whole_h = float(std::min(src_t.gh, dst_t.gh));
+        float whole_w = std::min(gw, float(dst_t.gw));
+        float whole_h = std::min(gh, float(dst_t.gh));
         DrawnRect r{.x0 = 0, .y0 = 0, .x1 = whole_w, .y1 = whole_h};
         if (listed) r = ReadDrawnRect(l.src_rects, l.dst_points, i);
         if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
@@ -3067,7 +3070,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
         cl_->RSSetViewports(1, &vp);
         cl_->RSSetScissorRects(1, &scissor);
         binds_ = {};
-        float uv[4] = {r.x0 / src_t.gw, r.y0 / src_t.gh, (r.x1 - r.x0) / src_t.gw, (r.y1 - r.y0) / src_t.gh};
+        float uv[4] = {r.x0 / gw, r.y0 / gh, (r.x1 - r.x0) / gw, (r.y1 - r.y0) / gh};
         uint32_t taps = uint32_t(std::ceil(std::max(src_scale / dst_scale, 1.0f) - kTapsSlack));
         float mul = 1 / dst_t.range;
         BlitOptions o{.alpha = true, .taps = taps, .mul = mul, .rtv = dst_t.fmt};
@@ -3115,7 +3118,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
 }
 
 void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
-                        uint32_t dst_points) {
+                        uint32_t dst_points, float src_kx, float src_ky) {
     PerfScope perf_copy{g_perf.copy};
     Target* src_t = FindTarget(src, false);
     if (cap_) {
@@ -3135,9 +3138,9 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
     Resolve(*src_t);
     Target* dst_t = EnsureTarget(dst, false);
     if (!dst_t || src_t == dst_t) return;
-    CopyList l{.count = count, .src_rects = src_rects, .dst_points = dst_points};
-    if (src_t->fmt != dst_t->fmt) {
-        // formats differ: drawn across
+    CopyList l{.count = count, .src_rects = src_rects, .dst_points = dst_points, .kx = src_kx, .ky = src_ky};
+    if (src_t->fmt != dst_t->fmt || src_kx != 1 || src_ky != 1) {
+        // formats or scales differ: drawn across
         CopyByDraw(*src_t, src_t->res.Get(), src_t->state, *dst_t, l);
         return;
     }
