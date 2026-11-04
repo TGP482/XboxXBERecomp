@@ -986,8 +986,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
     return n;
 }
 
-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
-    switch (a[0]) {
+static uint32_t DosError(uint32_t status) {
+    switch (status) {
         case kSuccess: return 0;
         case kPending: return 997;
         case kTimeout: return 1460;
@@ -1010,8 +1010,19 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
         case kNotADirectory: return 267;
         case 0xC000007F: return 112;  // disk full
         case kDeviceNotConnected: return 1167;
-        default: return (a[0] & 0xC0000000) ? 317 : 0;
+        default: return (status & 0xC0000000) ? 317 : 0;
     }
+}
+
+KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return DosError(a[0]); }
+
+// (completion routine, iosb, reserved): the APC of XAPI's ReadFileEx / WriteFileEx. The iosb is the OVERLAPPED's
+// first field, and as on Windows a failed transfer reports no bytes.
+KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
+    uint32_t status = R32(a[1]);
+    bool failed = status >= 0xC0000000;  // NT_ERROR
+    CallGuest(ctx, a[0], {failed ? DosError(status) : 0, failed ? 0 : R32(a[1] + 4), a[1]});
+    return 0;
 }
 
 // exceptions, debug, shutdown

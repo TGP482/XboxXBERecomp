@@ -48,7 +48,7 @@ enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, F
 struct Cmd {
     Op op;
     uint32_t a = 0, b = 0, c = 0, d = 0;
-    float f = 0;
+    float f = 0, g = 0;
     uint32_t data = 0, size = 0;  // bytes in Batch::bytes
     int32_t vs = -1, ps = -1;     // index in Batch::vs / ps: the shader changed
     Surface s1, s2;
@@ -159,10 +159,13 @@ public:
     }
 
     // rects and points are taken now; the copy itself, CPU or GPU, runs in order like the console's
-    void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override {
+    void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points,
+              float src_kx, float src_ky) override {
         auto t = Clock::now();
         Cmd c{Op::Copy};
         c.a = count;
+        c.f = src_kx;
+        c.g = src_ky;
         c.b = count && src_rects ? Scratch(kernel::HostPtr(src_rects), count * 16) : 0;
         c.c = count && dst_points ? Scratch(kernel::HostPtr(dst_points), count * 8) : 0;
         c.s1 = src;
@@ -457,7 +460,7 @@ private:
             }
             case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
-            case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
+            case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c, c.f, c.g); break;
             case Op::Present: inner_->Present(c.s1); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;

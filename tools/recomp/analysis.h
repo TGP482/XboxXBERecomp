@@ -90,7 +90,8 @@ public:
 
 private:
     bool DecodeFlow(uint32_t va, Insn& out, JumpTable* jt);
-    bool Walk(uint32_t entry, bool trusted, std::vector<uint32_t>* calls);
+    // overlap: an untrusted walk that keeps decodes overlapping earlier ones instead of failing on them
+    bool Walk(uint32_t entry, bool trusted, std::vector<uint32_t>* calls, bool overlap = false);
     void SeedPointers(bool late = false);
     bool PlausibleEntry(uint32_t va) const;
     void Adopt(const std::vector<uint32_t>& calls, bool trusted);

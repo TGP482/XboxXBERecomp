@@ -20,6 +20,8 @@ set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+# guest threads read the pads, which SDL's debug-only main thread checks reject
+set(SDL_ASSERTIONS release CACHE STRING "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
 
