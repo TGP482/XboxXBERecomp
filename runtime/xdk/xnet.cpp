@@ -587,7 +587,10 @@ HLE_STDCALL(accept, 3) {
             if (a[1]) std::memcpy(HostPtr(a[1]), &from, sizeof(from));
             if (a[2]) W32(a[2], sizeof(from));
             LOGI("xnet: accept %X from %s", a[0], Addr(from).c_str());
-            return AddSocket(s, false);
+            uint32_t id = AddSocket(s, false);
+            std::lock_guard<std::mutex> lock(g_lock);
+            g_sockets[id].nonblocking = k.nonblocking;  // as Winsock's accept: the listener's mode
+            return id;
         }
         int e = WSAGetLastError();
         if (e != WSAEWOULDBLOCK || k.nonblocking) return Fail(e);

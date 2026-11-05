@@ -85,6 +85,18 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundBuffer_SetEG FFFFFF0E
 #define HAS_IDirectSoundBuffer_SetEG 0
 #endif
+#ifndef SYM_IDirectSound_CreateSoundStream
+#define SYM_IDirectSound_CreateSoundStream FFFFFF0F
+#define HAS_IDirectSound_CreateSoundStream 0
+#endif
+#ifndef SYM_CDirectSoundStream_PauseEx
+#define SYM_CDirectSoundStream_PauseEx FFFFFF10
+#define HAS_CDirectSoundStream_PauseEx 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetRolloffFactor
+#define SYM_CDirectSoundStream_SetRolloffFactor FFFFFF11
+#define HAS_CDirectSoundStream_SetRolloffFactor 0
+#endif
 
 namespace {
 
@@ -755,7 +767,8 @@ static void AuditExports() {
         SYM(CDirectSoundStream_SetFrequency), SYM(CDirectSoundStream_SetFilter), SYM(CDirectSoundStream_SetHeadroom),
         SYM(CDirectSoundStream_SetMixBinVolumes), SYM(CDirectSoundStream_SetMixBins), SYM(CDirectSoundStream_SetMaxDistance),
         SYM(CDirectSoundStream_SetMinDistance), SYM(CDirectSoundStream_SetPosition), SYM(CDirectSoundStream_SetVelocity),
-        SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG)};
+        SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG),
+        SYM(IDirectSound_CreateSoundStream), SYM(CDirectSoundStream_PauseEx), SYM(CDirectSoundStream_SetRolloffFactor)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -1095,12 +1108,11 @@ BUFFER(SetFormat, 2) {
 
 // streams, the object carries the XDK's own vtable
 
-HLE_STDCALL(DirectSoundCreateStream, 2) {
+static uint32_t NewStream(uint32_t desc, uint32_t out) {
     XDK_REQUIRE("dsound", XDK_KEY(CDirectSoundStream_Vtable), XDK_KEY(CDirectSoundStream_Vtable2),
                 XDK_DATA(DSound_StreamVtable), XDK_DATA(DSound_StreamVtable2));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Start();
-    uint32_t desc = a[0];
     uint32_t obj = mem::AllocSystem(0x80);
     std::memset(HostPtr(obj), 0, 0x80);
     W32(obj + XDK_CDirectSoundStream_Vtable, kStreamVtable);
@@ -1116,9 +1128,12 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
     v.headroom = DefaultHeadroom(flags);
-    W32(a[1], obj);
+    W32(out, obj);
     return 0;
 }
+
+HLE_STDCALL(DirectSoundCreateStream, 2) { return NewStream(a[0], a[1]); }
+HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2]); }
 
 #define STREAM(name, nargs)                                     \
     static uint32_t str_##name(Voice& v, const Args& a);        \
@@ -1211,6 +1226,12 @@ STREAM(Pause, 2) {
     v.sync = a[1] == 2;
     return 0;
 }
+// (this, time low, time high, flags): takes effect now, the timestamp is not honored
+STREAM(PauseEx, 4) {
+    v.paused = a[3] == 1;
+    v.sync = a[3] == 2;
+    return 0;
+}
 STREAM(SetVolume, 2) {
     v.volume = Db(int32_t(a[1]));
     return 0;
@@ -1247,4 +1268,6 @@ STREAM(SetPosition, 5) {
     return 0;
 }
 STREAM(SetVelocity, 5) { return 0; }
+// (this, factor, apply): attenuation keeps the default factor of 1, like the listener's
+STREAM(SetRolloffFactor, 3) { return 0; }
 STREAM(SetI3DL2Source, 3) { return 0; }
