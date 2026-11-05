@@ -276,6 +276,11 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     return {MatchCase(best->second, parts).string()};
 }
 
+// a bare name with no device is missing in \??, any longer path misses a folder first
+uint32_t Unmapped(const std::string& name) {
+    return Normalize(name).find('\\') == std::string::npos ? kObjectNameNotFound : kObjectPathNotFound;
+}
+
 // the disc image is read only: nothing on it is created, replaced or written
 uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t handle_out, uint32_t iosb, uint32_t disposition,
                     uint32_t options) {
@@ -331,8 +336,9 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     const std::string& host = t.host;
     if (host.empty()) {
         LOGW("NtCreateFile: no mapping for %s", name.c_str());
-        IoStatus(iosb, kObjectPathNotFound, 0);
-        return kObjectPathNotFound;
+        uint32_t status = Unmapped(name);
+        IoStatus(iosb, status, 0);
+        return status;
     }
     std::error_code ec;
     bool exists = fs::exists(host, ec);
@@ -436,7 +442,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     if (host.empty() || !fs::exists(host, ec)) {
         LOG_FIRST(200, "missing %s", name.c_str());
         IoStatus(iosb, kObjectNameNotFound, 5);
-        return host.empty() ? kObjectPathNotFound : kObjectNameNotFound;
+        return host.empty() ? Unmapped(name) : kObjectNameNotFound;
     }
     auto f = std::make_shared<File>();
     f->host = host;

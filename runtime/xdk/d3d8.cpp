@@ -1,4 +1,4 @@
-// Direct3D 8 (XDK 4831 and 5849) entry points the title calls, implemented on the host renderer.
+// Direct3D 8 (XDK 4831, 5659 and 5849) entry points the title calls, implemented on the host renderer.
 // Resource creation, locking and the XG helpers stay recompiled: they only manage memory.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
