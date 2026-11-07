@@ -16,8 +16,8 @@ using namespace kernel;
 namespace {
 
 // XPP device type records: CurrentConnected, ChangeConnected, PreviousConnected
-constexpr uint32_t kGamepadType = SYM(XPP_GamepadType);
-constexpr uint32_t kMemoryUnitType = SYM(XPP_MemoryUnitType);
+constexpr hle::Va kGamepadType = SYM(XPP_GamepadType);
+constexpr hle::Va kMemoryUnitType = SYM(XPP_MemoryUnitType);
 
 std::mutex g_ports_lock;
 bool g_poller = false;
@@ -54,7 +54,7 @@ HLE_STDCALL(XInitDevices, 2) {
     W32(kGamepadType + XDK_XPP_Current, 0);
     W32(kGamepadType + XDK_XPP_Changed, 0);
     W32(kGamepadType + XDK_XPP_Previous, 0);
-    if constexpr (HAS_XPP_MemoryUnitType != 0) {  // titles without memory unit support have no record
+    if (HAS(XPP_MemoryUnitType)) {  // titles without memory unit support have no record
         W32(kMemoryUnitType + XDK_XPP_Current, 0);
         W32(kMemoryUnitType + XDK_XPP_Changed, 0);
         W32(kMemoryUnitType + XDK_XPP_Previous, 0);

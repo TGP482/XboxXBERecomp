@@ -100,8 +100,8 @@ X86Func* Find(uint32_t guest);
 
 namespace {
 
-constexpr uint32_t kStreamVtable = SYM(DSound_StreamVtable);  // CDirectSoundStream XMediaObject vtable
-constexpr uint32_t kStreamVtable2 = SYM(DSound_StreamVtable2);
+constexpr hle::Va kStreamVtable = SYM(DSound_StreamVtable);  // CDirectSoundStream XMediaObject vtable
+constexpr hle::Va kStreamVtable2 = SYM(DSound_StreamVtable2);
 constexpr uint32_t kPacketPending = 0x8000000A, kFlushed = 0x80004004;  // E_PENDING, E_ABORT
 
 struct Packet {

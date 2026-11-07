@@ -29,12 +29,21 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 }  // namespace xdk
 
 #define XDK_KEY(name) ::xdk::LayoutKey{#name, XDK_##name}
-#define XDK_DATA(name) ::xdk::LayoutKey{#name, HAS_##name ? SYM(name) : ::xdk::kUnknown}
+#define XDK_DATA(name) ::xdk::LayoutKey{#name, HAS(name) ? uint32_t(SYM(name)) : ::xdk::kUnknown}
+#ifdef IMAGE_NAMED
+// the loaded image's data addresses are known at run time only
+#define XDK_REQUIRE(lib, ...)                                                                  \
+    do {                                                                                       \
+        const ::xdk::LayoutKey keys_[] = {__VA_ARGS__};                                        \
+        if (!::xdk::AllKnown(keys_)) ::xdk::LayoutMissing(lib, keys_, std::size(keys_));        \
+    } while (0)
+#else
 #define XDK_REQUIRE(lib, ...)                                                                  \
     do {                                                                                       \
         static constexpr ::xdk::LayoutKey keys_[] = {__VA_ARGS__};                             \
         if constexpr (!::xdk::AllKnown(keys_)) ::xdk::LayoutMissing(lib, keys_, std::size(keys_)); \
     } while (0)
+#endif
 
 #ifndef XDK_CDevice_Push
 #define XDK_CDevice_Push 0xFFFFFFFFu

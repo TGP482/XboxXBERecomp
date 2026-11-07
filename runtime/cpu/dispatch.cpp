@@ -20,6 +20,7 @@
 #include "core/log.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
+#include "xdk/hle.h"
 
 #ifdef _WIN32
 #include <intrin.h>
@@ -90,6 +91,11 @@ bool Load(const std::filesystem::path& dll) {
     auto* hi = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86CodeEnd"));
     auto* entry = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86EntryPoint"));
     if (!g_mappings || !g_continuations || !lo || !hi || !entry) return false;
+#ifdef IMAGE_NAMED
+    auto* symbols = reinterpret_cast<const X86Symbol*>(GetProcAddress(m, "X86Symbols"));
+    if (!symbols) return false;
+    hle::ResolveSymbols(symbols);
+#endif
     g_lo = *lo;
     g_hi = *hi;
     g_entry = *entry;
@@ -104,6 +110,9 @@ void Init() {
 #ifndef _WIN32
     g_lo = X86CodeBase;
     g_hi = X86CodeEnd;
+#ifdef IMAGE_NAMED
+    hle::ResolveSymbols(X86Symbols);
+#endif
 #endif
     g_table.assign(g_hi - g_lo, nullptr);
     size_t n = 0;

@@ -23,7 +23,7 @@ X86_FUNC(GUEST(BinkGetSummary)) {
 // and advanced only once BinkWait, which follows the movie's own rate and audio, says it is due.
 namespace {
 
-constexpr uint32_t kBinkWait = SYM(BinkWait);
+constexpr hle::Va kBinkWait = SYM(BinkWait);
 std::mutex g_held_lock;
 std::unordered_set<uint32_t> g_held;  // movies whose frame was not decoded this game frame
 

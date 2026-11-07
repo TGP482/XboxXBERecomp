@@ -1,16 +1,72 @@
 #pragma once
+#include <cstring>
+#include <iterator>
 #include <string_view>
 #include <type_traits>
 
+#include "core/log.h"
+#include "cpu/x86_context.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
 
 // Symbols are named in config/<image>.toml; the recompiler writes their addresses to image_symbols.h
 #define X86_CAT_(a, b) a##b
 #define X86_CAT(a, b) X86_CAT_(a, b)
+#ifdef IMAGE_NAMED
+// [xbe] named: one executable serves each release of the game, so a name's address is the loaded image's, from the
+// X86Symbols its DLL exports; a name the config lacks keeps the placeholder the host gives it
+namespace hle {
+#define HLE_SYMBOL_NAME(name) #name,
+inline constexpr std::string_view kSymbolNames[] = {IMAGE_SYMBOLS(HLE_SYMBOL_NAME)};
+#undef HLE_SYMBOL_NAME
+constexpr uint32_t kSymbolCount = uint32_t(std::size(kSymbolNames));
+constexpr uint32_t kNotNamed = 0xFFFFFFFFu;
+constexpr uint32_t kAbsent = 0xFFFF0000u;  // the recompiler's addresses for functions not in the image
+inline uint32_t g_symbols[kSymbolCount] = {};
+
+consteval uint32_t Id(std::string_view name) {
+    for (uint32_t i = 0; i < kSymbolCount; i++)
+        if (kSymbolNames[i] == name) return i;
+    return kNotNamed;
+}
+
+struct Symbol {
+    uint32_t id;
+    uint32_t placeholder;
+    operator uint32_t() const { return id == kNotNamed ? placeholder : g_symbols[id]; }
+    bool Present(bool placeholder_present) const {
+        if (id == kNotNamed) return placeholder_present;
+        return g_symbols[id] && g_symbols[id] < kAbsent;
+    }
+};
+using Va = Symbol;
+
+inline void ResolveSymbols(const X86Symbol* table) {
+    bool found[kSymbolCount] = {};
+    for (const X86Symbol* s = table; s->name; s++) {
+        for (uint32_t i = 0; i < kSymbolCount; i++) {
+            if (kSymbolNames[i] != s->name) continue;
+            g_symbols[i] = s->va;
+            found[i] = true;
+        }
+    }
+    for (uint32_t i = 0; i < kSymbolCount; i++)
+        if (!found[i]) LOGE("symbols: %.*s is not in this image's config", int(kSymbolNames[i].size()), kSymbolNames[i].data());
+}
+}  // namespace hle
+#define SYM(name) (::hle::Symbol{::hle::Id(#name), X86_CAT(0x, SYM_##name)})  // address
+#define HAS(name) (SYM(name).Present(HAS_##name))
+#define GUEST(name) sub_##name
+#define GUEST_ORIG(name) __imp__sub_##name
+#else
+namespace hle {
+using Va = uint32_t;
+}
 #define SYM(name) X86_CAT(0x, SYM_##name)                 // address
+#define HAS(name) HAS_##name                              // in this image
 #define GUEST(name) X86_CAT(sub_, SYM_##name)             // the function, a host override if there is one
 #define GUEST_ORIG(name) X86_CAT(__imp__sub_, SYM_##name)  // the recompiled body
+#endif
 
 // Argument maps. A library built with link time code generation may take a function's arguments in registers. The
 // config's [abi] says where each API argument of such a function is, image_symbols.h lists the maps as IMAGE_ABI,

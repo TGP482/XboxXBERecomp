@@ -43,7 +43,20 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #define HAS_D3DDevice_EndPush 0
 #endif
 #ifndef HAS_D3D_FvfShader
+#define SYM_D3D_FvfShader 0
 #define HAS_D3D_FvfShader 0
+#endif
+#ifndef HAS_D3D_InternalAddRef
+#define SYM_D3D_InternalAddRef 0
+#define HAS_D3D_InternalAddRef 0
+#endif
+#ifndef HAS_D3D_InternalRelease
+#define SYM_D3D_InternalRelease 0
+#define HAS_D3D_InternalRelease 0
+#endif
+#ifndef HAS_D3D_InitDefaultState
+#define SYM_D3D_InitDefaultState 0
+#define HAS_D3D_InitDefaultState 0
 #endif
 #ifndef SYM_D3DDevice_SetPalette
 #define SYM_D3DDevice_SetPalette FFFFFE02
@@ -101,14 +114,14 @@ namespace {
 constexpr bool kRenderThread = XBE_RENDER_THREAD;
 
 // D3D globals of this build
-constexpr uint32_t kDevice = SYM(D3D_Device);        // the static CDevice, g_pDevice points at it
-constexpr uint32_t kDevicePtr = SYM(D3D_pDevice);
-constexpr uint32_t kIndexData = SYM(D3D_IndexData);  // index data base the inline draws read
-constexpr uint32_t kDirtyFlags = SYM(D3D_DirtyFlags);
-constexpr uint32_t kTextureState = SYM(D3D_DeferredTextureState);  // [4][32]
-constexpr uint32_t kRenderState = SYM(D3D_RenderState);            // [166]
-constexpr uint32_t kStreams = SYM(D3D_Streams);                    // [16] stride, offset, buffer
-constexpr uint32_t kSimpleEncode = SYM(D3D_SimpleRenderStateEncode);
+constexpr hle::Va kDevice = SYM(D3D_Device);        // the static CDevice, g_pDevice points at it
+constexpr hle::Va kDevicePtr = SYM(D3D_pDevice);
+constexpr hle::Va kIndexData = SYM(D3D_IndexData);  // index data base the inline draws read
+constexpr hle::Va kDirtyFlags = SYM(D3D_DirtyFlags);
+constexpr hle::Va kTextureState = SYM(D3D_DeferredTextureState);  // [4][32]
+constexpr hle::Va kRenderState = SYM(D3D_RenderState);            // [166]
+constexpr hle::Va kStreams = SYM(D3D_Streams);                    // [16] stride, offset, buffer
+constexpr hle::Va kSimpleEncode = SYM(D3D_SimpleRenderStateEncode);
 
 // CDevice fields mirrored so the recompiled getters and resource code see what the XDK would
 constexpr uint32_t kDevPush = XDK_CDevice_Push, kDevThreshold = XDK_CDevice_PushThreshold,
@@ -150,22 +163,21 @@ void SetDev(uint32_t off, uint32_t v) { W32(kDevice + off, v); }
 // also holds its parent. The library's functions do it when the image has them, inlined ones are done here.
 void AddRef(X86Context& ctx, uint32_t res) {
     if (!res) return;
-#if HAS_D3D_InternalAddRef
-    GUEST_CALL(D3D_InternalAddRef, ctx, {res});
-#else
-    (void)ctx;
+    if (HAS(D3D_InternalAddRef)) {
+        GUEST_CALL(D3D_InternalAddRef, ctx, {res});
+        return;
+    }
     uint32_t common = R32(res);
     if (!(common & 0x780000) && (common & 0x70000) == 0x50000)
         if (uint32_t parent = R32(res + 0x14)) W32(parent, R32(parent) + 0x80000);
     W32(res, R32(res) + 0x80000);
-#endif
 }
 void Release(X86Context& ctx, uint32_t res) {
     if (!res) return;
-#if HAS_D3D_InternalRelease
-    GUEST_CALL(D3D_InternalRelease, ctx, {res});
-#else
-    (void)ctx;
+    if (HAS(D3D_InternalRelease)) {
+        GUEST_CALL(D3D_InternalRelease, ctx, {res});
+        return;
+    }
     // the library frees a resource nothing holds any more; without its function the memory stays
     auto drop = [](uint32_t r) {
         W32(r, R32(r) - 0x80000);
@@ -175,7 +187,6 @@ void Release(X86Context& ctx, uint32_t res) {
     if ((common & 0x780000) == 0x80000 && (common & 0x70000) == 0x50000)
         if (uint32_t parent = R32(res + 0x14)) drop(parent);
     drop(res);
-#endif
 }
 
 void Walk(uint32_t end);
@@ -261,12 +272,8 @@ void SetComplex(uint32_t rs, uint32_t v) {
 
 // The library's default render and texture stage states; its pushes land in the scratch buffer
 void ApplyDefaultStates(X86Context& ctx) {
-#if HAS_D3D_InitDefaultState
-    GUEST_CALL(D3D_InitDefaultState, ctx, {});
-#else
-    (void)ctx;
-    LOG_FIRST(1, "d3d: the image has no D3D_InitDefaultState, default states were not applied");
-#endif
+    if (HAS(D3D_InitDefaultState)) GUEST_CALL(D3D_InitDefaultState, ctx, {});
+    else LOG_FIRST(1, "d3d: the image has no D3D_InitDefaultState, default states were not applied");
 }
 
 // The frame buffers a D3DPRESENT_PARAMETERS asks for become the device's targets, the viewport covers them. The
@@ -391,9 +398,7 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         uint8_t* ramp = static_cast<uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps));  // red, green, blue
         for (uint32_t i = 0; i < 256; i++) ramp[i] = ramp[256 + i] = ramp[512 + i] = uint8_t(i);
     }
-#if HAS_D3D_FvfShader
-    if (XDK_CDevice_VertexShader != xdk::kUnknown) SetDev(XDK_CDevice_VertexShader, SYM(D3D_FvfShader));
-#endif
+    if (HAS(D3D_FvfShader) && XDK_CDevice_VertexShader != xdk::kUnknown) SetDev(XDK_CDevice_VertexShader, SYM(D3D_FvfShader));
     if (kVBlank) {
         // notification event, signalled
         SetDev(XDK_CDevice_VBlankEvent, 0x00040000);
