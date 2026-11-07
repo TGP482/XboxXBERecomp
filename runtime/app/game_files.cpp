@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <fstream>
+#include <string_view>
 
 #include "app/app.h"
 #include "core/log.h"
@@ -36,6 +37,14 @@ fs::path FindAssets() {
         dir = dir.parent_path();
     }
     return {};
+}
+
+// the xbe this executable was recompiled from, or another release of it with its own config
+bool Runs(const std::string& sha) {
+    if (sha == kImageSha1) return true;
+    for (auto& [xbe, release] : kGame.releases)
+        if (std::string_view(xbe) == IMAGE_XBE && sha == release) return true;
+    return false;
 }
 
 bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
@@ -79,7 +88,7 @@ bool FindGame(GameFiles& game) {
     fs::path other_name;
     auto consider = [&](const fs::path& name, std::vector<uint8_t> xbe, std::unique_ptr<kernel::Disc> disc) {
         std::string sha = Sha1(xbe);
-        bool match = sha == kImageSha1;
+        bool match = Runs(sha);
         LOGR("Game: %s in %s, sha1 %s%s", IMAGE_XBE, name.string().c_str(), sha.c_str(), match ? "" : ", another release");
         if (match) {
             game = {assets, std::move(xbe)};

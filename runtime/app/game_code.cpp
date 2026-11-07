@@ -26,6 +26,9 @@
 #include "hook_exports.h"
 #include "image_symbols.h"
 #include "kernel/disc.h"
+#include "xbe/xbe.h"
+
+extern const char kImageSha1[];  // the xbe build.bat recompiled into this executable, written by CMake
 
 namespace dispatch {
 bool Load(const std::filesystem::path& dll);  // cpu/dispatch.cpp
@@ -88,17 +91,28 @@ int64_t NowMs() {
 
 fs::path CompilerDir() { return ExeDir() / "compiler"; }
 
-// the config in compiler\config whose [xbe] path is this xbe; an included one has no path
-fs::path ConfigFor(const std::string& xbe) {
+uint32_t EntryOf(const std::vector<uint8_t>& xbe) {
+    xbe::Image image;
+    std::string error;
+    return image.Parse(xbe, error) ? image.entry : 0;
+}
+
+// the config in compiler\config whose [xbe] path is this xbe; an included one has no path. Releases of one xbe each
+// have a config, told apart by the entry point xbe_symbols wrote into it.
+fs::path ConfigFor(const std::string& xbe, const std::vector<uint8_t>& data = {}) {
+    uint32_t entry = data.empty() ? 0 : EntryOf(data);
+    fs::path first;
     std::error_code ec;
     for (auto& e : fs::directory_iterator(CompilerDir() / "config", ec)) {
         try {
             toml::table t = toml::parse_file(e.path().string());
-            if (fs::path(t["xbe"]["path"].value_or(std::string())).filename() == xbe) return e.path();
+            if (fs::path(t["xbe"]["path"].value_or(std::string())).filename() != xbe) continue;
+            if (entry && t["xbe"]["entry"].value_or(int64_t(0)) == entry) return e.path();
+            if (first.empty()) first = e.path();
         } catch (const toml::parse_error&) {
         }
     }
-    return {};
+    return first;
 }
 
 std::vector<Image> Images() {
@@ -141,13 +155,15 @@ bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& 
     return true;
 }
 
-// build.bat's DLL has no stamp: it is current when newer than the executable it was linked against
+// build.bat's DLL has no stamp: it is current when newer than the executable it was linked against and the game is
+// the release it was built from
 bool Current(const Target& target) {
     std::error_code ec;
     fs::file_time_type built = fs::last_write_time(CodeDll(*target.image), ec);
     if (ec) return false;
     std::ifstream f(StampFile(*target.image));
-    if (!f) return built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
+    bool built_release = target.image->xbe != IMAGE_XBE || Sha1(target.xbe) == kImageSha1;
+    if (!f) return built_release && built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
     std::string line;
     return std::getline(f, line) && line == target.stamp;
 }
@@ -167,14 +183,15 @@ bool ReadXbe(const GameFiles& game, const char* name, std::vector<uint8_t>& out)
     return disc && disc->Load(name, out);
 }
 
-std::vector<Target> StaleTargets(const GameFiles& game, const std::vector<Image>& images) {
+std::vector<Target> StaleTargets(const GameFiles& game, std::vector<Image>& images) {
     std::vector<Target> stale;
-    for (const Image& image : images) {
+    for (Image& image : images) {
         Target target{&image};
         if (!ReadXbe(game, image.xbe.c_str(), target.xbe)) {
             LOGR("Game code: no %s in the game files, %ls is not built", image.xbe.c_str(), image.exe.c_str());
             continue;
         }
+        image.config = ConfigFor(image.xbe, target.xbe);
         if (!StampFor(image, target.xbe, target.stamp) || Current(target)) continue;
         stale.push_back(std::move(target));
     }

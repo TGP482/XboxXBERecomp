@@ -98,6 +98,8 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // xbe file name, SHA-1: other releases the executable runs, each from its own [xbe] named config
+    std::vector<std::pair<const char*, const char*>> releases;
 };
 extern const GameInfo kGame;
 
