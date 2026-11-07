@@ -33,7 +33,14 @@ struct X86FuncMapping {
     X86Func* host;
 };
 
+// [xbe] named: a [symbols], [names] or [data] name and its address in this image
+struct X86Symbol {
+    const char* name;
+    uint32_t va;
+};
+
 // produced by the recompiler, exported by the game code DLL
 extern "C" const X86FuncMapping X86FuncMappings[];
+extern "C" const X86Symbol X86Symbols[];  // [xbe] named, ends with a null name
 extern "C" const uint32_t X86Continuations[];  // zero terminated
 extern "C" const uint32_t X86CodeBase, X86CodeEnd, X86ImageBase, X86ImageEnd, X86EntryPoint, X86KernelThunk;

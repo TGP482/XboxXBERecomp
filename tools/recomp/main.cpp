@@ -48,6 +48,9 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
 //   [[function]] at, end  an entry decoded no further than end (exclusive); it also stops other walks
 //   [[switch]] at, targets  the targets of an indirect jmp, replacing table detection
 //   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml
+//   [xbe] named = true  functions in [symbols] and [names] are called sub_<name>, not sub_<address>, and the DLL
+//     exports X86Symbols, every name's address in this image
+//   [names] name = address  the game's own functions the host replaces or calls, with [xbe] named
 //   [abi] name = ["esi", "stack", ...]  where a [symbols] function takes each API argument when the image does not
 //     use the convention the host declares: a register, or "stack" for the next stack slot, which the callee pops
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
@@ -87,6 +90,7 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
     if (auto v = t["xbe"]["partitions"].value<int64_t>()) cfg.partitions = uint32_t(*v);
     if (auto v = t["xbe"]["gap_fill"].value<bool>()) cfg.gap_fill = *v;
     if (auto v = t["xbe"]["pointer_seeds"].value<bool>()) cfg.pointer_seeds = *v;
+    if (auto v = t["xbe"]["named"].value<bool>()) cfg.named = *v;
     if (auto a = t["xbe"]["code_sections"].as_array())
         for (auto& i : *a)
             if (auto s = i.value<std::string>()) cfg.code_sections.push_back(*s);
@@ -100,7 +104,7 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
                                            uint32_t(r->get(1)->value<int64_t>().value_or(0))});
     if (auto f = t["functions"].as_table())
         for (auto& [k, v] : *f) cfg.functions[ParseAddr(k.str())] = v.value<std::string>().value_or("");
-    for (auto [key, out] : {std::pair{"symbols", &cfg.symbols}, std::pair{"data", &cfg.data}})
+    for (auto [key, out] : {std::pair{"symbols", &cfg.symbols}, std::pair{"data", &cfg.data}, std::pair{"names", &cfg.names}})
         if (auto f = t[key].as_table())
             for (auto& [k, v] : *f) (*out)[std::string(k.str())] = uint32_t(v.value<int64_t>().value_or(0));
     if (auto f = t["layout"].as_table())
@@ -166,6 +170,8 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
         }
     for (auto& [name, va] : cfg.symbols)
         if (va) cfg.functions.emplace(va, name);
+    for (auto& [name, va] : cfg.names)
+        if (va) cfg.functions.emplace(va, name);
     return true;
 }
 
@@ -212,6 +218,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s: [xbe] needs library = \"<exe>.dll\", the game code DLL the executable loads\n", args[0].c_str());
         return 1;
     }
+    if (!cfg.names.empty() && !cfg.named) {
+        std::fprintf(stderr, "%s: [names] needs [xbe] named = true\n", args[0].c_str());
+        return 1;
+    }
+    for (auto& [name, va] : cfg.names)
+        if (cfg.symbols.count(name)) {
+            std::fprintf(stderr, "%s: %s is in both [symbols] and [names]\n", args[0].c_str(), name.c_str());
+            return 1;
+        }
     for (auto& [name, locs] : cfg.abi)
         if (!cfg.symbols.count(name)) {
             std::fprintf(stderr, "%s: [abi] %s is not a [symbols] name\n", args[0].c_str(), name.c_str());

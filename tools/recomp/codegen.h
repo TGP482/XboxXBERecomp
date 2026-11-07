@@ -59,6 +59,7 @@ private:
         bool is_test = false;
         unsigned bits = 32;
     } pending_;
+    std::map<uint32_t, std::string> named_;  // [xbe] named: the functions named for their symbol
     std::map<std::string, size_t> unimpl_;
     size_t insn_count_ = 0;
     int ret_bytes_ = -1;

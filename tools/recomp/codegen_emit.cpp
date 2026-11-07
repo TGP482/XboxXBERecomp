@@ -207,12 +207,29 @@ bool CodeGen::Run() {
     std::string syms = "#pragma once\n";
     syms += F("#define IMAGE_XBE \"%s\"\n", fs::path(an_.cfg.xbe_path).filename().string().c_str());
     std::vector<uint32_t> absent;
-    for (auto& [name, va] : an_.cfg.symbols) {
+    std::map<std::string, uint32_t> functions = an_.cfg.symbols;
+    functions.insert(an_.cfg.names.begin(), an_.cfg.names.end());
+    std::string ids;   // [xbe] named: every name, for xdk/hle.h
+    std::string rows;  // and its address in this image, exported as X86Symbols
+    for (auto& [name, va] : functions) {
         uint32_t a = va ? va : 0xFFFF0000u + uint32_t(absent.size());
         if (!va) absent.push_back(a);
         syms += F("#define SYM_%s %08X\n#define HAS_%s %d\n", name.c_str(), a, name.c_str(), va ? 1 : 0);
+        if (!an_.cfg.named) continue;
+        auto [at, fresh] = named_.emplace(a, name);
+        if (!fresh) {
+            std::fprintf(stderr, "[xbe] named: %s and %s are one function, %08X\n", at->second.c_str(), name.c_str(), a);
+            return false;
+        }
+        ids += " \\\n\tX(" + name + ")";
+        rows += F("\t{\"%s\", 0x%Xu},\n", name.c_str(), a);
     }
-    for (auto& [name, va] : an_.cfg.data) syms += F("#define SYM_%s %08X\n#define HAS_%s %d\n", name.c_str(), va, name.c_str(), va ? 1 : 0);
+    for (auto& [name, va] : an_.cfg.data) {
+        syms += F("#define SYM_%s %08X\n#define HAS_%s %d\n", name.c_str(), va, name.c_str(), va ? 1 : 0);
+        ids += " \\\n\tX(" + name + ")";
+        rows += F("\t{\"%s\", 0x%Xu},\n", name.c_str(), va);
+    }
+    if (an_.cfg.named) syms += "#define IMAGE_NAMED 1\n#define IMAGE_SYMBOLS(X)" + ids + "\n";
     for (auto& [name, v] : an_.cfg.layout) syms += F("#define XDK_%s 0x%X\n", name.c_str(), v);
     // argument maps, one X(name, location...) row each; xdk/hle.h makes the table
     if (!an_.cfg.abi.empty()) {
@@ -286,6 +303,7 @@ bool CodeGen::Run() {
     map += "\nconst uint32_t X86Continuations[] = {\n";
     for (uint32_t c : an_.continuations) map += F("\t0x%Xu,\n", c);
     map += "\t0,\n};\n";
+    if (an_.cfg.named) map += "\nconst X86Symbol X86Symbols[] = {\n" + rows + "\t{nullptr, 0},\n};\n";
     for (uint32_t f : absent) {
         map += F("\nX86_FUNC(__imp__%s) { x86_trap(ctx, 0x%Xu, \"not in this image\"); }\n", FuncName(f).c_str(), f);
         map += F("X86_WEAK_FUNC(%s, __imp__%s)\n", FuncName(f).c_str(), FuncName(f).c_str());
@@ -299,6 +317,7 @@ bool CodeGen::Run() {
     std::string aliases;
     for (const char* table : {"X86FuncMappings", "X86Continuations", "X86CodeBase", "X86CodeEnd", "X86EntryPoint"})
         exports += F("    %s DATA\n", table);
+    if (an_.cfg.named) exports += "    X86Symbols DATA\n";
     for (const std::vector<uint32_t>* list : {&funcs, &absent}) {
         for (uint32_t f : *list) {
             std::string name = FuncName(f);
