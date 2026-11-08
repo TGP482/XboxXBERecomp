@@ -8,7 +8,6 @@
 #include <windows.h>
 
 #include <algorithm>
-#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -122,19 +121,6 @@ Mode Output() {
     return Desktop();
 }
 
-bool Widescreen() {
-    // asked per frame and per HUD quad: the desktop mode lookup only runs when the resolution setting changes
-    static std::atomic<uint64_t> key{~0ull};
-    static std::atomic<bool> wide{true};
-    const Settings& s = Get();
-    uint64_t k = uint64_t(s.width) << 32 | s.height;
-    if (key.exchange(k) != k) {
-        Mode m = Output();
-        wide = m.width * 2 >= m.height * 3;  // 3:2 or wider
-    }
-    return wide;
-}
-
 // Output for every frame: the desktop mode lookup reads the registry, so it runs again only when the resolution
 // setting or the window's monitor changes
 Mode CachedOutput() {
@@ -155,6 +141,12 @@ Mode CachedOutput() {
         mode = Output();
     }
     return mode;
+}
+
+// asked per frame and per HUD quad: CachedOutput costs a monitor lookup, the registry only on a change
+bool Widescreen() {
+    Mode m = CachedOutput();
+    return m.width * 2 >= m.height * 3;  // 3:2 or wider
 }
 
 float RenderScale(uint32_t guest_height) {
