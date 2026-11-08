@@ -162,6 +162,10 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSound_SetAllParameters FFFFFF21
 #define HAS_IDirectSound_SetAllParameters 0
 #endif
+#ifndef SYM_DirectSoundGetSampleTime
+#define SYM_DirectSoundGetSampleTime FFFFFF22
+#define HAS_DirectSoundGetSampleTime 0
+#endif
 
 namespace {
 
@@ -902,7 +906,7 @@ static void AuditExports() {
         SYM(IDirectSoundBuffer_SetPitch), SYM(IDirectSoundBuffer_SetLFO),
         SYM(CDirectSoundStream_GetVoiceProperties), SYM(CDirectSoundStream_Set3DVoiceData),
         SYM(CDirectSoundStream_Use3DVoiceData), SYM(CDirectSoundStream_SetPitch), SYM(CDirectSoundStream_SetLFO),
-        SYM(CDirectSoundStream_SetOutputBuffer), SYM(IDirectSound_SetAllParameters)};
+        SYM(CDirectSoundStream_SetOutputBuffer), SYM(IDirectSound_SetAllParameters), SYM(DirectSoundGetSampleTime)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -937,6 +941,23 @@ HLE_STDCALL(DirectSoundCreate, 3) {
 HLE_STDCALL(IDirectSound_Release, 1) { return 0; }
 HLE_STDCALL(DirectSoundUseFullHRTF, 0) { return 0; }
 // DirectSoundUseLightHRTF runs its own code: it fills the 3D function table XACT's own 3D pass calls
+
+// the APU's 48 kHz sample counter, a 32 bit register that wraps
+static uint32_t SampleTime() {
+    using namespace std::chrono;
+    using Samples = duration<int64_t, std::ratio<1, audio::kRate>>;
+    static const steady_clock::time_point start = steady_clock::now();
+    return uint32_t(duration_cast<Samples>(steady_clock::now() - start).count());
+}
+
+HLE_STDCALL(DirectSoundGetSampleTime, 0) { return SampleTime(); }
+
+// a title reading the counter register 0xFE80200C itself (XACT's engine clock) gets a [[hook]] calling this,
+// on_true past the read
+bool ReadSampleTime(X86Context& ctx, uint8_t*) {
+    ctx.eax = SampleTime();
+    return true;
+}
 HLE_STDCALL(IDirectSound_GetSpeakerConfig, 2) {
     W32(a[1], 0);  // DSSPEAKER_STEREO
     return 0;
