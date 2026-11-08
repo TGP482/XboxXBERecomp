@@ -86,9 +86,14 @@ toml::table Table() {
 
 }  // namespace
 
+// written beside the real file and renamed over it, so a crash mid save keeps the old settings
 void Save() {
-    std::ofstream f(File());
+    std::filesystem::path tmp = File();
+    tmp += ".tmp";
+    std::ofstream f(tmp);
     f << Table() << "\n";
+    f.close();
+    if (f) MoveFileExW(tmp.c_str(), File().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 void LogSettings() {
