@@ -355,9 +355,6 @@ void Complete(Voice& v, Packet& pk, uint32_t status) {
     }
 }
 
-// the console's stereo downmix of the speaker bins: centre and back pair at -3 dB, the sub dropped
-constexpr float kFold = 0.707f;
-
 // A voice with no speaker bin and no effects image plays its loudest bin on the front pair; with speaker bins the
 // crosstalk bins join their speakers and effect sends are dropped. Without the title's image nothing reads them.
 void RouteWithoutImage(const Voice& v, Gains& g) {
@@ -414,6 +411,7 @@ struct Place {
     bool on = false;
     float att = 1;      // distance, every bin
     float front = 1;    // crosstalk front pair
+    float back = 0;     // crosstalk back pair
     float centre = 1;   // centre bin
     float azimuth = 0;  // degrees, plus to the right
     float elevation = 0;
@@ -474,6 +472,16 @@ void ShareCentre(Place& at) {
     at.front *= 1 - 0.5f * both * both;
 }
 
+// Share of a 3D voice for the crosstalk pair behind, by power, as the library splits it: none to 45 degrees, half at
+// 90, all from 135, drawn towards half and half within half a unit of the head
+float BackShare(float azimuth, float elevation, float dist) {
+    float a = std::fabs(azimuth) / 90;
+    float e = std::fabs(elevation) / 90;
+    float back = std::clamp(0.5f - (1 - a) * (1 - e), 0.0f, 1.0f);
+    if (dist < 0.5f) back = ((back - 0.5f) * dist + 1) * 0.5f;
+    return back;
+}
+
 // distance attenuation, 1.0 inside the min distance: min / distance, or the voice's rolloff curve
 float Attenuation(const Voice& v, float dist) {
     if (dist <= v.min_dist) return 1;
@@ -520,7 +528,8 @@ Place Locate(const Voice& v) {
     bool relative = v.mode == 1;  // the position is already in listener space
     float d[3] = {v.p[0], v.p[1], v.p[2]};
     for (int i = 0; i < 3 && !relative; i++) d[i] -= g_listener[i];
-    at.att = Attenuation(v, std::sqrt(Dot(d, d)));
+    float dist = std::sqrt(Dot(d, d));
+    at.att = Attenuation(v, dist);
     float right[3] = {g_top[1] * g_front[2] - g_top[2] * g_front[1], g_top[2] * g_front[0] - g_top[0] * g_front[2],
                       g_top[0] * g_front[1] - g_top[1] * g_front[0]};
     const float* front = relative ? kAhead : g_front;
@@ -528,6 +537,12 @@ Place Locate(const Voice& v) {
     const float* top = relative ? kUp : g_top;
     at.azimuth = Azimuth(d, front, side);
     at.elevation = Elevation(d, front, side, top);
+    // a surround console splits the crosstalk pairs, a stereo one plays the front alone
+    if (audio::IsSurround()) {
+        float back = BackShare(at.azimuth, at.elevation, dist);
+        at.front = std::sqrt(1 - back);
+        at.back = std::sqrt(back);
+    }
     at.centre = at.front;
     if (v.nbins >= 5 && v.bin[4] == kCentre) ShareCentre(at);
     return at;
@@ -537,7 +552,7 @@ float BinScale(const Place& at, uint32_t b) {
     if (!at.on) return 1;
     if (b == kCentre) return at.att * at.centre;
     if (b == kCrosstalkFrontLeft || b == kCrosstalkFrontRight) return at.att * at.front;
-    if (b == kCrosstalkBackLeft || b == kCrosstalkBackRight) return 0;
+    if (b == kCrosstalkBackLeft || b == kCrosstalkBackRight) return at.att * at.back;
     return at.att;
 }
 
@@ -724,10 +739,10 @@ void Render(float* out, uint32_t frames) {
         MixVoice(v, bins.data(), frames);
     }
     if (dsp::Loaded()) dsp::Run(bins.data(), frames);
+    // the speaker bins in their order, the output folds them for the device
+    static_assert(kFrontLeft == 0 && kBackRight + 1 == audio::kChannels);
     for (uint32_t i = 0; i < frames; i++) {
-        const float* b = &bins[size_t(i) * kBins];
-        out[i * 2] = std::clamp(b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]), -1.0f, 1.0f);
-        out[i * 2 + 1] = std::clamp(b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]), -1.0f, 1.0f);
+        std::copy_n(&bins[size_t(i) * kBins], audio::kChannels, out + size_t(i) * audio::kChannels);
     }
 }
 
@@ -959,7 +974,13 @@ bool ReadSampleTime(X86Context& ctx, uint8_t*) {
     return true;
 }
 HLE_STDCALL(IDirectSound_GetSpeakerConfig, 2) {
-    W32(a[1], 0);  // DSSPEAKER_STEREO
+    constexpr uint32_t kStereo = 0;
+    constexpr uint32_t kMono = 1;                     // DSSPEAKER_MONO
+    constexpr uint32_t kSurroundAc3 = 0x2 | 0x10000;  // DSSPEAKER_SURROUND | DSSPEAKER_ENABLE_AC3
+    uint32_t config = kStereo;
+    if (audio::IsMono()) config = kMono;
+    if (audio::IsSurround()) config = kSurroundAc3;
+    W32(a[1], config);
     return 0;
 }
 // hardware voices the library's pools start with (XDK 5659 0x1EF5D1, 0x1EF5DA)

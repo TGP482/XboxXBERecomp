@@ -15,6 +15,7 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#include "audio/audio.h"
 #include "core/log.h"
 
 namespace app {
@@ -53,11 +54,13 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
     }
     if (kGame.load) kGame.load(&t);
+    audio::SetOutputMode(s.audio_output);
 }
 
 namespace {
@@ -74,7 +77,8 @@ toml::table Table() {
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
-                  {"join_ip", s.join_ip}};
+                  {"join_ip", s.join_ip},
+                  {"audio_output", int64_t(s.audio_output)}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));
