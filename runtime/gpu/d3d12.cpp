@@ -1997,7 +1997,8 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.AddressU = Address(clamp && t[kTssAddressU] == kTaddressWrap ? kTaddressClamp : t[kTssAddressU]);
     sd.AddressV = Address(clamp && t[kTssAddressV] == kTaddressWrap ? kTaddressClamp : t[kTssAddressV]);
     sd.AddressW = Address(t[kTssAddressW]);
-    sd.MipLODBias = Bits(t[kTssMipLodBias]);
+    // the title can ask past the range the hardware takes
+    sd.MipLODBias = std::clamp(Bits(t[kTssMipLodBias]), D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX);
     sd.MinLOD = float(t[kTssMaxMipLevel]);
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
