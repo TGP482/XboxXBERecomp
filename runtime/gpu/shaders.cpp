@@ -220,7 +220,8 @@ std::string VsInputs(uint16_t regs, uint64_t decode) {
 const char* kVsEpilogue = R"(
     VOut o;
     precise float4 p = oPos;
-    p.w = magclamp(p.w);
+    // w 0 is screen space; clamped to 2^-64 its clip coordinates near 1e-20 lose draws on AMD, w 1 draws the same
+    p.w = p.w == 0 ? 1 : magclamp(p.w);
     precise float4 q;
     // full screen passes drawn half a pixel up-left for the console's integer pixel centers stop half a pixel short
     // of the far edges on D3D12's, which upscaled leaves the last host columns and rows undrawn
