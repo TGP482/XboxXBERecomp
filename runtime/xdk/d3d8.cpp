@@ -107,12 +107,6 @@ namespace d3d {
 
 namespace {
 
-// A/B switch: 0 draws on the title's thread, as before
-#ifndef XBE_RENDER_THREAD
-#define XBE_RENDER_THREAD 1
-#endif
-constexpr bool kRenderThread = XBE_RENDER_THREAD;
-
 // D3D globals of this build
 constexpr hle::Va kDevice = SYM(D3D_Device);        // the static CDevice, g_pDevice points at it
 constexpr hle::Va kDevicePtr = SYM(D3D_pDevice);
@@ -310,7 +304,7 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
             kernel::Shutdown(1);
         }
-        if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
+        g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
     SetDev(kDevRenderTarget, g_buffers[1]);

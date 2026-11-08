@@ -6,12 +6,8 @@
 
 #include "kernel/kernel.h"
 
-#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#else
-#include <pthread.h>
-#endif
 
 namespace kernel {
 
@@ -82,7 +78,6 @@ void MarkExited(Thread& t, uint32_t code) {
 }
 
 void NameHostThread(const char* name) {
-#ifdef _WIN32
     wchar_t w[64];
     size_t i = 0;
     for (; name[i] && i < 63; i++) w[i] = wchar_t(name[i]);
@@ -90,15 +85,11 @@ void NameHostThread(const char* name) {
     using Fn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
     static Fn set = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
     if (set) set(GetCurrentThread(), w);
-#else
-    pthread_setname_np(pthread_self(), name);
-#endif
 }
 
 // recompiled code nests host frames as deep as the guest's calls, give it room
 void Spawn(std::function<void()> fn) {
     auto* f = new std::function<void()>(std::move(fn));
-#ifdef _WIN32
     auto entry = [](void* p) -> DWORD {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
         (*g)();
@@ -106,19 +97,6 @@ void Spawn(std::function<void()> fn) {
     };
     HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (h) ::CloseHandle(h);
-#else
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 64u << 20);
-    pthread_t th;
-    pthread_create(&th, &attr, [](void* p) -> void* {
-        std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
-        (*g)();
-        return nullptr;
-    }, f);
-    pthread_detach(th);
-    pthread_attr_destroy(&attr);
-#endif
 }
 
 }  // namespace
@@ -207,11 +185,7 @@ void ExitThread(uint32_t code) {
         Unregister(t);
     }
     t_current.reset();
-#ifdef _WIN32
     ::ExitThread(code);
-#else
-    pthread_exit(nullptr);
-#endif
 }
 
 void Resume(Thread& t) {

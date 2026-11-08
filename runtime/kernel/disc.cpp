@@ -4,7 +4,6 @@
 #include <cctype>
 #include <cstring>
 
-#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -12,10 +11,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 namespace kernel {
 
@@ -51,16 +46,11 @@ std::string Upper(std::string s) {
 
 Disc::~Disc() {
     if (file_ == -1) return;
-#ifdef _WIN32
     CloseHandle(HANDLE(file_));
-#else
-    close(int(file_));
-#endif
 }
 
 // each read carries its own position, so threads reading at once do not queue on one handle
 uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
-#ifdef _WIN32
     thread_local HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     OVERLAPPED o{};
     o.Offset = DWORD(at);
@@ -70,19 +60,11 @@ uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
     if (!ReadFile(HANDLE(file_), out, len, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) return 0;
     if (!GetOverlappedResult(HANDLE(file_), &o, &got, TRUE)) return 0;
     return got;
-#else
-    ssize_t got = pread(int(file_), out, len, off_t(at));
-    return got > 0 ? uint32_t(got) : 0;
-#endif
 }
 
 bool Disc::Open(const std::filesystem::path& path, std::string& error) {
     path_ = path;
-#ifdef _WIN32
     file_ = intptr_t(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
-#else
-    file_ = open(path.c_str(), O_RDONLY);
-#endif
     if (file_ == -1) {
         error = "cannot open the file";
         return false;

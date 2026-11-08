@@ -14,11 +14,7 @@ inline bool Perf() {
 // XBE_CAPTURE_DIR: where F3 saves a frame, empty: F3 does not capture
 inline const std::filesystem::path& CaptureDir() {
     static const std::filesystem::path dir = [] {
-#ifdef _WIN32
         const wchar_t* v = _wgetenv(L"XBE_CAPTURE_DIR");
-#else
-        const char* v = std::getenv("XBE_CAPTURE_DIR");
-#endif
         return v ? std::filesystem::path(v) : std::filesystem::path();
     }();
     return dir;

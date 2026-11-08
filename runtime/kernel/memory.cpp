@@ -8,12 +8,8 @@
 
 #include "core/log.h"
 
-#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#else
-#include <sys/mman.h>
-#endif
 
 namespace mem {
 
@@ -30,7 +26,6 @@ static bool InPhysical(uint32_t va) {
 
 bool Init() {
     const uint64_t size = 1ull << 32;
-#ifdef _WIN32
     HANDLE ram = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
     // a fixed base keeps crash dumps comparable between runs
     for (uint64_t hint : {0x100000000ull, 0x200000000ull, 0x300000000ull, 0ull}) {
@@ -54,15 +49,6 @@ bool Init() {
         UnmapViewOfFile(b + kContiguousBase);
         UnmapViewOfFile(b + kWriteCombineBase);
     }
-#else
-    void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
-    int fd = g_base ? memfd_create("ram", 0) : -1;
-    if (fd < 0 || ftruncate(fd, kPhysicalSize) ||
-        mmap(g_base + kContiguousBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
-        mmap(g_base + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
-        g_base = nullptr;
-#endif
     if (!g_base) {
         LOGE("memory: could not reserve the 4 GB guest space");
         return false;
@@ -79,17 +65,10 @@ bool Commit(uint32_t va, uint32_t size) {
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-#ifdef _WIN32
     if (!VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE)) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
         return false;
     }
-#else
-    if (mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE)) {
-        LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
-        return false;
-    }
-#endif
     for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 1;
     return true;
 }
@@ -99,12 +78,7 @@ void Decommit(uint32_t va, uint32_t size) {
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-#ifdef _WIN32
     VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
-#else
-    madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
-    mprotect(g_base + first, size_t(end - first), PROT_NONE);
-#endif
     for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
 }
 

@@ -75,12 +75,6 @@ void Convert(uint32_t type, const uint8_t* p, float* o) {
     }
 }
 
-// A/B switch: 0 converts every vertex on the CPU, the older path
-#ifndef XBE_RAW_VERTICES
-#define XBE_RAW_VERTICES 1
-#endif
-constexpr bool kRawVertices = XBE_RAW_VERTICES;
-
 // D3DVSDT type as the input assembler reads it: DXGI format, what the vertex shader does after, bytes the format reads
 struct HostElement {
     uint8_t format = 0;
@@ -467,7 +461,7 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     Inputs inputs = {*layout, regs, nregs};
 
     // the guest's own vertices when the input assembler can read every element of them
-    bool raw = kRawVertices && RawReadable(s, inputs);
+    bool raw = RawReadable(s, inputs);
     if (raw) return AssembleRaw(s, inputs, d, out);
     return AssembleConverted(s, inputs, d, out);
 }

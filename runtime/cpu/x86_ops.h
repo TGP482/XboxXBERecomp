@@ -30,15 +30,9 @@ typedef double __attribute__((aligned(1), may_alias)) x86_f64u;
 // the DLL links without a C runtime: the two symbols clang expects from one
 extern "C" __attribute__((used)) inline int _fltused = 0;
 #pragma comment(linker, "/alternatename:??_7type_info@@6B@=_fltused")  // catch clauses only compare type names
-#elif defined(_WIN32)
+#else
 #define X86_HOST_API __declspec(dllexport)
 #define X86_HOST_EXPORT __declspec(dllexport)
-#else
-// the headless harness links the generated code into its executable
-#define X86_HOST_API
-#define X86_HOST_EXPORT
-#define X86_WEAK_FUNC(name, impl) \
-    extern "C" __attribute__((weak, noinline)) void name(X86Context& __restrict ctx, uint8_t* base) { impl(ctx, base); }
 #endif
 
 #define X86_FUNC(name) extern "C" X86_HOST_EXPORT void name(X86Context& __restrict ctx, uint8_t* base)

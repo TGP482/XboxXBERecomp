@@ -139,11 +139,7 @@ bool WildMatch(const std::string& pat, const std::string& s) {
 
 // past 2 GB a long offset wraps on Windows
 void Seek(FILE* fp, uint64_t pos) {
-#ifdef _WIN32
     _fseeki64(fp, int64_t(pos), SEEK_SET);
-#else
-    fseeko(fp, off_t(pos), SEEK_SET);
-#endif
 }
 
 void IoStatus(uint32_t iosb, uint32_t status, uint32_t info) {

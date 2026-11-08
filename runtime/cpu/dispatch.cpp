@@ -1,4 +1,3 @@
-#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,7 +5,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#endif
 
 #include <atomic>
 #include <chrono>
@@ -22,13 +20,8 @@
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 
-#ifdef _WIN32
 #include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
 
-#ifdef _WIN32
 // the C runtime functions the game code DLL calls, passed on to the DLLs that have them
 #pragma comment(linker, "/EXPORT:memcpy=vcruntime140.memcpy")
 #pragma comment(linker, "/EXPORT:memmove=vcruntime140.memmove")
@@ -47,24 +40,16 @@
 #pragma comment(linker, "/EXPORT:exp2=ucrtbase.exp2")
 #pragma comment(linker, "/EXPORT:ldexp=ucrtbase.ldexp")
 #pragma comment(linker, "/EXPORT:frexp=ucrtbase.frexp")
-#endif
 
 namespace {
 
 std::vector<X86Func*> g_table;  // one slot per code byte
 std::vector<bool> g_continuation;
 uint32_t g_lo = 0, g_hi = 0;
-#ifdef _WIN32
 // the recompiled code's tables, exported by the game code DLL
 const X86FuncMapping* g_mappings = nullptr;
 const uint32_t* g_continuations = nullptr;
 uint32_t g_entry = 0;
-#else
-// the headless harness links them in
-const X86FuncMapping* g_mappings = X86FuncMappings;
-const uint32_t* g_continuations = X86Continuations;
-uint32_t g_entry = X86EntryPoint;
-#endif
 
 struct Export {
     const char* name = nullptr;
@@ -80,7 +65,6 @@ constexpr uint32_t kKernelThunkBase = 0xFE000000;
 
 namespace dispatch {
 
-#ifdef _WIN32
 // the game code DLL and its tables; data comes by name, as the delay loaded imports carry only functions
 bool Load(const std::filesystem::path& dll) {
     HMODULE m = LoadLibraryW(dll.c_str());
@@ -101,19 +85,11 @@ bool Load(const std::filesystem::path& dll) {
     g_entry = *entry;
     return true;
 }
-#endif
 
 uint32_t EntryPoint() { return g_entry; }
 bool InCode(uint32_t va) { return va >= g_lo && va < g_hi; }
 
 void Init() {
-#ifndef _WIN32
-    g_lo = X86CodeBase;
-    g_hi = X86CodeEnd;
-#ifdef IMAGE_NAMED
-    hle::ResolveSymbols(X86Symbols);
-#endif
-#endif
     g_table.assign(g_hi - g_lo, nullptr);
     size_t n = 0;
     for (const X86FuncMapping* m = g_mappings; m->host; m++, n++)
@@ -259,9 +235,7 @@ void x86_trap(X86Context& ctx, uint32_t va, const char* what) {
     LOGE("guest trap at %08X: %s", va, what);
     kernel::LogGuestStack(ctx, 64);
     logx::Flush();
-#ifdef _WIN32
     __debugbreak();
-#endif
     std::abort();
 }
 
