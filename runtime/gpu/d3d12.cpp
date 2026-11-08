@@ -2568,7 +2568,8 @@ bool UnitTexcoords(const Assembled& a) {
     constexpr uint32_t kSmallDrawVertices = 4096;  // most vertices a small draw has
     if (!a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return false;
     bool any = false;
-    for (int r = 0; r < 16; r++) {
+    constexpr int kPositionRegister = 0;  // D3DVSDE_POSITION; 2D sprites send x, y in pixels as FLOAT2
+    for (int r = kPositionRegister + 1; r < 16; r++) {
         const VertexElement& e = a.elements[size_t(r)];
         if (!(a.regs >> r & 1) || e.format != DXGI_FORMAT_R32G32_FLOAT) continue;
         const VertexBuffer& vb = a.buffers[e.buffer];
