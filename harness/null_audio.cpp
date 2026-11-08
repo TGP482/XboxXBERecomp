@@ -7,6 +7,8 @@
 
 namespace audio {
 
+void SetVolume(float) {}
+
 void StartOutput(std::function<void(float*, uint32_t)> render) {
     std::thread([render] {
         std::vector<float> b(kRate / 100 * 2);

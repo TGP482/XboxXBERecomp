@@ -8,6 +8,9 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -15,6 +18,12 @@
 #include "core/log.h"
 
 namespace audio {
+
+namespace {
+std::atomic<float> g_volume{1.0f};
+}
+
+void SetVolume(float volume) { g_volume = volume; }
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
     std::thread([render] {
@@ -36,6 +45,14 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
             LOGE("audio: XAudio2 unavailable (%08X), no sound", unsigned(hr));
             return;
         }
+        // XBE_MUTE=1 silences only the output: the mixer and the guest's sound state run exactly as audible, so a
+        // capture or benchmark run cannot be heard and nothing in the game's audio timing changes
+        const char* m = std::getenv("XBE_MUTE");
+        const bool mute = m && m[0] && std::strcmp(m, "0") != 0;
+        if (mute) {
+            master->SetVolume(0.0f);
+            LOGR("audio: XBE_MUTE, output silenced");
+        }
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100;
         constexpr uint32_t kMinQueued = 3;
@@ -44,7 +61,12 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         constexpr uint32_t kSlots = kMaxQueued + 1;
         std::vector<float> bufs(kSlots * kFrames * 2);
         uint32_t depth = kMinQueued;
+        float volume = 1.0f;
         for (uint32_t n = 0;;) {
+            if (float v = g_volume; v != volume && !mute) {
+                volume = v;
+                master->SetVolume(v);
+            }
             XAUDIO2_VOICE_STATE st;
             voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
             // a starved voice crackles: queue one buffer more each time, up to kMaxQueued
