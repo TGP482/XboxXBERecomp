@@ -97,6 +97,18 @@ X86Func* Find(uint32_t guest);
 #define SYM_CDirectSoundStream_SetRolloffFactor FFFFFF11
 #define HAS_CDirectSoundStream_SetRolloffFactor 0
 #endif
+#ifndef SYM_IDirectSound_GetCaps
+#define SYM_IDirectSound_GetCaps FFFFFF12
+#define HAS_IDirectSound_GetCaps 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetMode
+#define SYM_IDirectSoundBuffer_SetMode FFFFFF13
+#define HAS_IDirectSoundBuffer_SetMode 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetDopplerFactor
+#define SYM_IDirectSoundBuffer_SetDopplerFactor FFFFFF14
+#define HAS_IDirectSoundBuffer_SetDopplerFactor 0
+#endif
 
 namespace {
 
@@ -743,7 +755,8 @@ float F32(uint32_t v) {
 static void AuditExports() {
     static const uint32_t handled[] = {
         SYM(DirectSoundCreate), SYM(IDirectSound_Release), SYM(DirectSoundUseFullHRTF), SYM(DirectSoundUseLightHRTF),
-        SYM(IDirectSound_GetSpeakerConfig),
+        SYM(IDirectSound_GetSpeakerConfig), SYM(IDirectSound_GetCaps), SYM(IDirectSoundBuffer_SetMode),
+        SYM(IDirectSoundBuffer_SetDopplerFactor),
         SYM(IDirectSound_SetEffectData), SYM(IDirectSound_EnableHeadphones), SYM(IDirectSound_SetMixBinHeadroom),
         SYM(IDirectSound_CommitDeferredSettings), SYM(IDirectSound_SetDopplerFactor), SYM(IDirectSound_SetRolloffFactor),
         SYM(IDirectSound_SetDistanceFactor), SYM(IDirectSound_SetVelocity), SYM(IDirectSound_SetI3DL2Listener),
@@ -805,6 +818,25 @@ HLE_STDCALL(DirectSoundUseFullHRTF, 0) { return 0; }
 HLE_STDCALL(DirectSoundUseLightHRTF, 0) { return 0; }
 HLE_STDCALL(IDirectSound_GetSpeakerConfig, 2) {
     W32(a[1], 0);  // DSSPEAKER_STEREO
+    return 0;
+}
+// hardware voices the library's pools start with (XDK 5659 0x1EF5D1, 0x1EF5DA)
+constexpr int32_t kFree2DVoices = 192;
+constexpr int32_t kFree3DVoices = 64;
+// (this, DSCAPS): free 2D and 3D voices, then buffer SGEs and allocated memory, which the host does not count
+HLE_STDCALL(IDirectSound_GetCaps, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    int32_t free2d = kFree2DVoices;
+    int32_t free3d = kFree3DVoices;
+    for (auto& [obj, v] : g_voices) {
+        uint32_t channels = std::min<uint32_t>(v.channels, kMaxChannels);
+        if (v.is3d) free3d--;
+        else free2d -= int32_t((channels - 1) / 2 + 1);
+    }
+    W32(a[1], uint32_t(std::max(free2d, 0)));
+    W32(a[1] + 4, uint32_t(std::max(free3d, 0)));
+    W32(a[1] + 8, 0);
+    W32(a[1] + 12, 0);
     return 0;
 }
 // (this, effect, offset, data, size, flags): writes the effect's state
@@ -1084,6 +1116,12 @@ BUFFER(SetPosition, 5) {
 }
 BUFFER(SetVelocity, 5) { return 0; }
 BUFFER(SetI3DL2Source, 3) { return 0; }
+// (this, DS3DMODE, apply)
+BUFFER(SetMode, 3) {
+    v.mode = a[1];
+    return 0;
+}
+BUFFER(SetDopplerFactor, 3) { return 0; }
 // (this, DS3DBUFFER, apply): position at +4, distances at +0x34 and +0x38, mode at +0x3C
 BUFFER(SetAllParameters, 3) {
     for (int i = 0; i < 3; i++) v.p[i] = F32(R32(a[1] + 4 + i * 4));
