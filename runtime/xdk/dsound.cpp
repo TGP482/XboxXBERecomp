@@ -1,6 +1,7 @@
 // DirectSound (XDK 4831, 5659 and 5849) on a host software mixer. Buffers and streams are read from guest memory as they play.
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -109,6 +110,58 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundBuffer_SetDopplerFactor FFFFFF14
 #define HAS_IDirectSoundBuffer_SetDopplerFactor 0
 #endif
+#ifndef SYM_IDirectSoundBuffer_AddRef
+#define SYM_IDirectSoundBuffer_AddRef FFFFFF15
+#define HAS_IDirectSoundBuffer_AddRef 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_GetVoiceProperties
+#define SYM_IDirectSoundBuffer_GetVoiceProperties FFFFFF16
+#define HAS_IDirectSoundBuffer_GetVoiceProperties 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_Set3DVoiceData
+#define SYM_IDirectSoundBuffer_Set3DVoiceData FFFFFF17
+#define HAS_IDirectSoundBuffer_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_Use3DVoiceData
+#define SYM_IDirectSoundBuffer_Use3DVoiceData FFFFFF18
+#define HAS_IDirectSoundBuffer_Use3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetPitch
+#define SYM_IDirectSoundBuffer_SetPitch FFFFFF19
+#define HAS_IDirectSoundBuffer_SetPitch 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetLFO
+#define SYM_IDirectSoundBuffer_SetLFO FFFFFF1A
+#define HAS_IDirectSoundBuffer_SetLFO 0
+#endif
+#ifndef SYM_CDirectSoundStream_GetVoiceProperties
+#define SYM_CDirectSoundStream_GetVoiceProperties FFFFFF1B
+#define HAS_CDirectSoundStream_GetVoiceProperties 0
+#endif
+#ifndef SYM_CDirectSoundStream_Set3DVoiceData
+#define SYM_CDirectSoundStream_Set3DVoiceData FFFFFF1C
+#define HAS_CDirectSoundStream_Set3DVoiceData 0
+#endif
+#ifndef SYM_CDirectSoundStream_Use3DVoiceData
+#define SYM_CDirectSoundStream_Use3DVoiceData FFFFFF1D
+#define HAS_CDirectSoundStream_Use3DVoiceData 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetPitch
+#define SYM_CDirectSoundStream_SetPitch FFFFFF1E
+#define HAS_CDirectSoundStream_SetPitch 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetLFO
+#define SYM_CDirectSoundStream_SetLFO FFFFFF1F
+#define HAS_CDirectSoundStream_SetLFO 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetOutputBuffer
+#define SYM_CDirectSoundStream_SetOutputBuffer FFFFFF20
+#define HAS_CDirectSoundStream_SetOutputBuffer 0
+#endif
+#ifndef SYM_IDirectSound_SetAllParameters
+#define SYM_IDirectSound_SetAllParameters FFFFFF21
+#define HAS_IDirectSound_SetAllParameters 0
+#endif
 
 namespace {
 
@@ -170,6 +223,9 @@ struct Voice {
     std::deque<Packet> packets;
     // levels
     float volume = 1, headroom = 1;
+    // DS3DVOICEDATA from the title's own 3D pass (XACT), used instead of the voice's 3D parameters when on
+    bool use_data = false;
+    uint32_t voice_data[14] = {};
     uint8_t nbins = 0, bin[8] = {};
     int32_t bin_mb[32] = {};  // by mix bin
     std::vector<float> curve;  // rolloff
@@ -426,10 +482,34 @@ float Attenuation(const Voice& v, float dist) {
     return from + (v.curve[i] - from) * (at - i);
 }
 
+// DS3DVOICEDATA dwords: mB levels, pitch, I3DL2 levels and degrees
+constexpr uint32_t kDataDistance = 1;
+constexpr uint32_t kDataCone = 2;
+constexpr uint32_t kDataFront = 5;
+constexpr uint32_t kDataCentre = 6;
+constexpr uint32_t kDataDirect = 7;
+constexpr uint32_t kDataRoom = 8;
+constexpr uint32_t kDataPitch = 9;
+constexpr uint32_t kDataAzimuth = 10;
+constexpr uint32_t kDataElevation = 11;
+
+// the title's 3D pass already did distance, cone and the centre share
+Place DataPlace(const Voice& v) {
+    Place at;
+    at.on = true;
+    at.att = Db(int32_t(v.voice_data[kDataDistance])) * Db(int32_t(v.voice_data[kDataCone]));
+    at.front = Db(int32_t(v.voice_data[kDataFront]));
+    at.centre = Db(int32_t(v.voice_data[kDataCentre]));
+    at.azimuth = std::bit_cast<float>(v.voice_data[kDataAzimuth]);
+    at.elevation = std::bit_cast<float>(v.voice_data[kDataElevation]);
+    return at;
+}
+
 Place Locate(const Voice& v) {
     static const float kAhead[3] = {0, 0, 1};
     static const float kRight[3] = {1, 0, 0};
     static const float kUp[3] = {0, 1, 0};
+    if (v.use_data) return DataPlace(v);
     Place at;
     if (!v.is3d || v.mode == 2) return at;
     at.on = true;
@@ -705,6 +785,41 @@ void SetBinVolumes(Voice& v, uint32_t mixbins) {
     uint32_t n = std::min<uint32_t>(R32(mixbins), 32), pairs = R32(mixbins + 4);
     for (uint32_t i = 0; i < n; i++) v.bin_mb[R32(pairs + i * 8) & 31] = int32_t(R32(pairs + i * 8 + 4));
 }
+// The library copies only the dwords whose flag is set: 1 [1], 2 [2], 4 [3,4], 8 [5,6], 0x10 [7,8], 0x20 [9],
+// 0x40 [10,11], 0x80 [12,13]
+void ReadVoiceData(Voice& v, uint32_t data) {
+    static const uint8_t kFirst[8] = {1, 2, 3, 5, 7, 9, 10, 12};
+    static const uint8_t kCount[8] = {1, 1, 2, 2, 2, 1, 2, 2};
+    uint32_t flags = R32(data);
+    if (!(flags & 0xFF)) return;
+    v.voice_data[0] = flags;
+    for (uint32_t bit = 0; bit < 8; bit++) {
+        if (!(flags >> bit & 1)) continue;
+        for (uint32_t k = kFirst[bit]; k < kFirst[bit] + kCount[bit]; k++) v.voice_data[k] = R32(data + k * 4);
+    }
+}
+
+// DSVOICEPROPS: the mix bins and their volumes (unused pairs bin -1 at -10000), pitch, then the 3D voice data
+void WriteVoiceProps(const Voice& v, uint32_t props) {
+    constexpr uint32_t kPairs = 8;
+    uint32_t voices = (std::min<uint32_t>(v.channels, kMaxChannels) - 1) / 2 + 1;
+    uint32_t n = v.nbins ? v.nbins : std::min<uint32_t>(voices * 2, 6);
+    W32(props, n);
+    for (uint32_t i = 0; i < kPairs; i++) {
+        uint32_t bin = v.nbins ? v.bin[i] : i;
+        W32(props + 4 + i * 8, i < n ? bin : 0xFFFFFFFFu);
+        W32(props + 8 + i * 8, i < n ? uint32_t(v.bin_mb[bin & 31]) : uint32_t(-10000));
+    }
+    static const uint32_t kData[5] = {kDataDistance, kDataCone, kDataPitch, kDataDirect, kDataRoom};
+    W32(props + 0x44, 0);
+    for (uint32_t i = 0; i < 5; i++) W32(props + 0x48 + i * 4, v.use_data ? v.voice_data[kData[i]] : 0);
+}
+
+// lPitch is 1/4096 octaves from 48 kHz
+uint32_t PitchToFrequency(uint32_t pitch) {
+    return uint32_t(std::lround(audio::kRate * std::exp2(int32_t(pitch) / 4096.0)));
+}
+
 // 600 mB unless 3D or a mix in or effect in buffer
 float DefaultHeadroom(uint32_t flags) { return flags & 0x382010 ? 1.0f : Db(-600); }
 
@@ -781,7 +896,13 @@ static void AuditExports() {
         SYM(CDirectSoundStream_SetMixBinVolumes), SYM(CDirectSoundStream_SetMixBins), SYM(CDirectSoundStream_SetMaxDistance),
         SYM(CDirectSoundStream_SetMinDistance), SYM(CDirectSoundStream_SetPosition), SYM(CDirectSoundStream_SetVelocity),
         SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG),
-        SYM(IDirectSound_CreateSoundStream), SYM(CDirectSoundStream_PauseEx), SYM(CDirectSoundStream_SetRolloffFactor)};
+        SYM(IDirectSound_CreateSoundStream), SYM(CDirectSoundStream_PauseEx), SYM(CDirectSoundStream_SetRolloffFactor),
+        SYM(IDirectSoundBuffer_AddRef), SYM(IDirectSoundBuffer_GetVoiceProperties),
+        SYM(IDirectSoundBuffer_Set3DVoiceData), SYM(IDirectSoundBuffer_Use3DVoiceData),
+        SYM(IDirectSoundBuffer_SetPitch), SYM(IDirectSoundBuffer_SetLFO),
+        SYM(CDirectSoundStream_GetVoiceProperties), SYM(CDirectSoundStream_Set3DVoiceData),
+        SYM(CDirectSoundStream_Use3DVoiceData), SYM(CDirectSoundStream_SetPitch), SYM(CDirectSoundStream_SetLFO),
+        SYM(CDirectSoundStream_SetOutputBuffer), SYM(IDirectSound_SetAllParameters)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -815,7 +936,7 @@ HLE_STDCALL(DirectSoundCreate, 3) {
 }
 HLE_STDCALL(IDirectSound_Release, 1) { return 0; }
 HLE_STDCALL(DirectSoundUseFullHRTF, 0) { return 0; }
-HLE_STDCALL(DirectSoundUseLightHRTF, 0) { return 0; }
+// DirectSoundUseLightHRTF runs its own code: it fills the 3D function table XACT's own 3D pass calls
 HLE_STDCALL(IDirectSound_GetSpeakerConfig, 2) {
     W32(a[1], 0);  // DSSPEAKER_STEREO
     return 0;
@@ -874,6 +995,16 @@ HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) {
 HLE_STDCALL(IDirectSound_SetPosition, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (int i = 0; i < 3; i++) g_listener[i] = F32(a[1 + i]);
+    return 0;
+}
+// (this, DS3DLISTENER, apply): position at +4, front at +0x1C, top at +0x28
+HLE_STDCALL(IDirectSound_SetAllParameters, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    for (int i = 0; i < 3; i++) {
+        g_listener[i] = F32(R32(a[1] + 4 + i * 4));
+        g_front[i] = F32(R32(a[1] + 0x1C + i * 4));
+        g_top[i] = F32(R32(a[1] + 0x28 + i * 4));
+    }
     return 0;
 }
 HLE_STDCALL(IDirectSound_SetOrientation, 8) {
@@ -1137,6 +1268,24 @@ BUFFER(SetRolloffCurve, 4) {
     return 0;
 }
 BUFFER(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
+BUFFER(AddRef, 1) { return uint32_t(++v.refs); }
+BUFFER(GetVoiceProperties, 2) {
+    WriteVoiceProps(v, a[1]);
+    return 0;
+}
+BUFFER(Set3DVoiceData, 2) {
+    ReadVoiceData(v, a[1]);
+    return 0;
+}
+BUFFER(Use3DVoiceData, 2) {
+    v.use_data = a[1] != 0;
+    return 0;
+}
+BUFFER(SetPitch, 2) {
+    v.freq = PitchToFrequency(a[1]);
+    return 0;
+}
+BUFFER(SetLFO, 2) { return 0; }  // modulation is not played, as with SetEG
 BUFFER(SetFormat, 2) {
     ReadFormat(v, a[1]);
     v.freq = 0;
@@ -1279,6 +1428,24 @@ STREAM(SetFrequency, 2) {
     return 0;
 }
 STREAM(SetFilter, 2) { return 0; }
+STREAM(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
+STREAM(GetVoiceProperties, 2) {
+    WriteVoiceProps(v, a[1]);
+    return 0;
+}
+STREAM(Set3DVoiceData, 2) {
+    ReadVoiceData(v, a[1]);
+    return 0;
+}
+STREAM(Use3DVoiceData, 2) {
+    v.use_data = a[1] != 0;
+    return 0;
+}
+STREAM(SetPitch, 2) {
+    v.freq = PitchToFrequency(a[1]);
+    return 0;
+}
+STREAM(SetLFO, 2) { return 0; }  // modulation is not played, as with SetEG
 // the library's own writes voice registers a host stream does not have; envelopes are not played
 HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
 STREAM(SetHeadroom, 2) {
