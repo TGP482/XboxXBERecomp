@@ -914,7 +914,8 @@ std::string PixelHlsl(const PixelKey& k) {
             body += "outc.rgb = " + D + " + lerp(" + C + ", " + B + ", " + A + ");\n";
             body += "outc.a = " + G + ";\n";
         } else {
-            body += "float4 outc = float4(lerp(fogin.rgb, r0.rgb, fogin.a), r0.a);\n";
+            // the final combiner reads r0 unsigned, a negative alpha reaches the alpha test as 0
+            body += "float4 outc = float4(lerp(fogin.rgb, saturate(r0.rgb), fogin.a), saturate(r0.a));\n";
         }
     } else {
         body += "float4 cur = v0, tmp = 0;\n";
