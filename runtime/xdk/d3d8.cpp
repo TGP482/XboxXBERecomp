@@ -564,6 +564,7 @@ HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
     if (XDK_CDevice_GammaRamps != xdk::kUnknown)
         for (uint32_t slot = 0; slot < 2; slot++)
             std::memcpy(HostPtr(kDevice + XDK_CDevice_GammaRamps + slot * sizeof(ramp)), ramp, sizeof(ramp));
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_backend) g_backend->SetGamma(ramp);
     return 0;
 }
