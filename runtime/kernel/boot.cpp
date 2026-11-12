@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -170,6 +171,7 @@ std::wstring HandoverEvent(unsigned long process) {
 }
 
 void Relaunch(const char* exe) {
+    std::fflush(nullptr);  // the guest's files are buffered host streams: what it wrote reaches the disk
     logx::Flush();
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -203,6 +205,9 @@ void Relaunch(const char* exe) {
 
 void Shutdown(int code) {
     LOGR("Exit (%d)", code);
+    // _Exit runs no stdio cleanup, and closing the window ends the process while the guest still has files open
+    // (a save being written): every buffered host stream is written out first
+    std::fflush(nullptr);
     logx::Flush();
     std::_Exit(code);
 }
