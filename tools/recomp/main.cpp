@@ -56,7 +56,7 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
     toml::table t;
     try {
-        t = toml::parse_file(path.string());
+        t = toml::parse_file(path.u8string());
     } catch (const toml::parse_error& e) {
         std::fprintf(stderr, "%s: %s\n", path.string().c_str(), std::string(e.description()).c_str());
         return false;
