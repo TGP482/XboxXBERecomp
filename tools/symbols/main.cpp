@@ -612,7 +612,7 @@ std::string WriteSig(const Sig& s) {
 // the parsed file, or nothing after printing why it does not parse
 std::optional<toml::table> ParseToml(const fs::path& p) {
     try {
-        return toml::parse_file(p.string());
+        return toml::parse_file(p.u8string());
     } catch (const toml::parse_error& e) {
         std::fprintf(stderr, "%s: %s\n", p.string().c_str(), std::string(e.description()).c_str());
         return std::nullopt;

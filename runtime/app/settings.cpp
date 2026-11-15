@@ -37,7 +37,7 @@ void Load() {
     Settings& s = Get();
     toml::table t;
     try {
-        t = toml::parse_file(File().string());
+        t = toml::parse_file(File().u8string());
     } catch (...) {
         return;
     }
