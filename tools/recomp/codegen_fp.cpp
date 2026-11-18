@@ -182,7 +182,7 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
             emit("double v = X87_ST(1) * std::log2(X87_ST(0) + 1.0); x87_pop(ctx); X87_ST(0) = v;");
             return true;
         case ZYDIS_MNEMONIC_FSCALE:
-            emit("X87_ST(0) = std::ldexp(X87_ST(0), (int)std::trunc(X87_ST(1)));");
+            emit("X87_ST(0) = x87_scale(X87_ST(0), X87_ST(1));");
             return true;
         case ZYDIS_MNEMONIC_FRNDINT: emit("X87_ST(0) = x87_round(ctx, X87_ST(0));"); return true;
         case ZYDIS_MNEMONIC_FPREM:
