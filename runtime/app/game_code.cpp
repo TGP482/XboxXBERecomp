@@ -126,7 +126,8 @@ std::vector<Image> Images() {
 
 fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
 fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
-fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
+// beside the DLL, so deleting the compiler folder keeps it
+fs::path StampFile(const Image& image) { return ExeDir() / (image.exe + L"_built.txt"); }
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
 fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
 

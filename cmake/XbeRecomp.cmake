@@ -138,5 +138,5 @@ function(add_xbe_image target xbe config partitions game_dir)
         -Wl,/def:${GEN}/exports.def)
     # a stamp from an earlier build on the executable's first start would outrank this DLL
     add_custom_command(TARGET ${target}_code POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E rm -f ${XBE_COMPILER_DIR}/work/${target}/built.txt)
+        COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE_DIR:${target}_code>/${target}_built.txt)
 endfunction()
