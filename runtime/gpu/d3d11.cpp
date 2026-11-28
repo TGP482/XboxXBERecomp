@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -47,6 +48,8 @@ constexpr uint64_t kStaleFrames = 8;     // frames a target may go unused and st
 constexpr UINT kRingBytes = 64u << 20;   // vertices and indices between wraps
 constexpr size_t kStateObjectsMax = 4000;  // Direct3D 11 keeps at most 4096 of each kind
 constexpr UINT kPassConstantBytes = 256;
+constexpr uint32_t kQueries = 8192;  // occlusion queries in flight, several frames of counted draws
+constexpr uint32_t kNoQuery = ~0u;
 constexpr float kLodBiasMin = -16.0f;  // D3D11_MIP_LOD_BIAS_MIN and MAX
 constexpr float kLodBiasMax = 15.99f;
 
@@ -243,6 +246,8 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override { ctx_->Flush(); }
     void SetGamma(const uint8_t* ramp) override;
+    void ClearReport() override { counted_.clear(); }
+    void GetReport(uint32_t report) override { reports_.push_back({report, counted_}); }
 
 private:
     // Init, in order, each callee right after its caller
@@ -297,11 +302,18 @@ private:
     const States& EnsureStates(const PsoKey& k);
     void ApplyStates(const State& s, const PsoKey& k);
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                         GuestExtent size);
+                         GuestExtent size, DrawConstants& c);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     void SetViewportScissor(const State& s, uint32_t gw);
+    void CaptureTextures(const State& s, const DrawTextures& stages);
     void DrawGeometry(const Assembled& a);
     UINT Stream(const void* p, UINT size, UINT align, ComPtr<ID3D11Buffer>& buf);
+
+    // visibility tests
+    uint32_t BeginCountedDraw(const State& s);
+    void EndCountedDraw(uint32_t query);
+    float SamplesPerPixel() const;
+    void DeliverReports();
 
     // Clear's arguments past the state
     struct ClearArgs {
@@ -325,6 +337,7 @@ private:
     void CopyByRegion(const Target& src_t, Target& dst_t, const CopyList& l);
 
     // Present, in call order, each callee right after its caller
+    void FinishCapture(const Surface& front);
     void ResizeSwap();
     void UploadGammaRamp();
     void DrawFrame(Target* t);
@@ -347,6 +360,11 @@ private:
     struct Late;
     void ResetLate(Late& l, const Target& t);
     void RecordLateCopy(Late& l, ID3D11Texture2D* src);
+
+    // F3 capture: a view CapSave shrinks to w x h and writes, colour times mul
+    void CapSave(ID3D11ShaderResourceView* srv, uint32_t w, uint32_t h, float mul, const char* name);
+    void CapSave(Target& t, const char* name);
+    void CapStep(const Surface& rt);
 
     ComPtr<IDXGIFactory2> factory_;
     ComPtr<ID3D11Device> dev_;
@@ -427,6 +445,29 @@ private:
     std::unordered_map<uint32_t, Late> late_;
     std::mutex late_lock_;                    // DeliverLate runs on the title's thread
     std::atomic<uint64_t> presents_seen_{0};  // presents_ for DeliverLate
+
+    // visibility tests: an occlusion query per counted draw, summed into report memory once the GPU is done
+    struct Query {
+        uint32_t index;
+        float samples_per_pixel;  // host samples one console pixel covers
+    };
+    struct Report {
+        uint32_t va;
+        std::vector<Query> queries;
+    };
+    std::vector<ComPtr<ID3D11Query>> queries_ = std::vector<ComPtr<ID3D11Query>>(kQueries);  // made on first use
+    uint32_t query_next_ = 0;
+    std::vector<Query> counted_;  // since the last ClearReport
+    std::deque<Report> reports_;
+
+    CaptureLog cap_;
+    struct CapTex {
+        ComPtr<ID3D11ShaderResourceView> srv;
+        uint32_t data;
+        uint32_t w;
+        uint32_t h;
+    };
+    std::vector<CapTex> cap_tex_;
 
     Assembled asm_;  // kept between draws for its buffers
     uint64_t presents_ = 0;
@@ -869,6 +910,7 @@ bool D3D11Backend::DepthCopy(const State& s) {
     if (!pass) return false;
     Target& dst = di->second;
     Target& src = si->second;
+    if (cap_.file) fprintf(cap_.file, "%04u depth copy %08X to %08X\n", cap_.i++, src.data, dst.data);
     ctx_->OMSetRenderTargets(0, nullptr, dst.dsv.Get());
     bound_rt_ = bound_ds_ = nullptr;
     SetFullViewport(dst.w, dst.h);
@@ -1274,8 +1316,7 @@ void D3D11Backend::ApplyStates(const State& s, const PsoKey& k) {
 }
 
 void D3D11Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                                   GuestExtent size) {
-    DrawConstants c{};
+                                   GuestExtent size, DrawConstants& c) {
     FillSurfaceConstants(s, size, c);
     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
@@ -1338,7 +1379,7 @@ D3D11_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.MaxLOD = mip ? D3D11_FLOAT32_MAX : sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
     if (stages.info[i].shadow) {
-        // the console tests texel OP r, Direct3D tests r OP texel; with both reversed (g_reversed_depth) it is the same OP
+        // the console tests texel OP r, Direct3D tests r OP texel; both reversed (g_reversed_depth) keep the OP
         sd.Filter = lin(min) || lin(mag) ? D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
                                          : D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
         sd.ComparisonFunc = Cmp(s.rs[kRsShadowFunc]);
@@ -1432,6 +1473,7 @@ void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
+    if (cap_.file) CapStep(s.rt);
     if (DepthCopy(s)) return;
     Assembled& a = asm_;
     {
@@ -1472,11 +1514,86 @@ void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // constants, texture views and samplers, viewport and scissor
     GuestExtent size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
-    UploadConstants(s, sh, k, stages, size);
+    DrawConstants c{};
+    UploadConstants(s, sh, k, stages, size, c);
+    if (cap_.file) {
+        WriteDrawLine(cap_, s, {prim, count, bound_ds_ ? s.zs.data : 0}, k, c);
+        CaptureTextures(s, stages);
+        EndDrawLine(cap_, s, a, count, c);
+        CaptureShaders(cap_, s, a, sh, pk);
+    }
     SetTextureViewsAndSamplers(s, a, stages);
     SetViewportScissor(s, size.w);
 
+    // geometry, counted while the title runs a visibility test
+    uint32_t query = BeginCountedDraw(s);
     DrawGeometry(a);
+    EndCountedDraw(query);
+}
+
+void D3D11Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+    for (int i = 0; i < 4; i++) {
+        TextureDesc d;
+        if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+        bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
+        ID3D11ShaderResourceView* srv = stages.srv[i];
+        fprintf(cap_.file, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height,
+                tg ? " target" : "", srv ? "" : " unbound");
+        if (srv && !tg && stages.info[i].kind == kTex2D && cap_.seen.insert(d.data).second) {
+            cap_tex_.push_back({srv, d.data, d.width, d.height});
+        }
+    }
+}
+
+// a draw while the title counts visible pixels gets an occlusion query of its own, kNoQuery otherwise
+uint32_t D3D11Backend::BeginCountedDraw(const State& s) {
+    if (!s.simple[kMCountEnable >> 2]) return kNoQuery;
+    uint32_t query = query_next_++ % kQueries;
+    ComPtr<ID3D11Query>& q = queries_[query];
+    D3D11_QUERY_DESC qd{D3D11_QUERY_OCCLUSION, 0};
+    if (!q && FAILED(dev_->CreateQuery(&qd, &q))) {
+        LOG_FIRST(1, "d3d11: no occlusion queries, visibility tests stay pending");
+        return kNoQuery;
+    }
+    ctx_->Begin(q.Get());
+    return query;
+}
+
+void D3D11Backend::EndCountedDraw(uint32_t query) {
+    if (query == kNoQuery) return;
+    ctx_->End(queries_[query].Get());
+    counted_.push_back({query, SamplesPerPixel()});
+}
+
+// the console counts its own pixels: the bound target's scale comes out
+float D3D11Backend::SamplesPerPixel() const {
+    const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
+    if (!t || !t->gw || !t->gh) return 1;
+    return float(t->w) * float(t->h) / (float(t->gw) * float(t->gh));
+}
+
+// reports whose queries the GPU has finished, in order, written as the console's GPU writes them: time, count, then 0
+// for done
+void D3D11Backend::DeliverReports() {
+    constexpr uint32_t kTime = 0;
+    constexpr uint32_t kTimeHigh = 4;
+    constexpr uint32_t kCount = 8;
+    constexpr uint32_t kStatus = 12;
+    while (!reports_.empty()) {
+        const Report& r = reports_.front();
+        double pixels = 0;
+        for (const Query& q : r.queries) {
+            UINT64 n = 0;
+            if (ctx_->GetData(queries_[q.index].Get(), &n, sizeof(n), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) return;
+            pixels += double(n) / q.samples_per_pixel;
+        }
+        kernel::W32(r.va + kTime, uint32_t(presents_));
+        kernel::W32(r.va + kTimeHigh, 0);
+        kernel::W32(r.va + kCount, uint32_t(std::lround(pixels)));
+        std::atomic_thread_fence(std::memory_order_release);
+        kernel::W32(r.va + kStatus, 0);
+        reports_.pop_front();
+    }
 }
 
 // rs: the rects buffer, reused across targets
@@ -1534,7 +1651,10 @@ void D3D11Backend::ClearRects(Target& t, const ClearArgs& c, const float col[4],
     ctx_->RSSetViewports(1, &vp);
     BindPass(*pass, k, sizeof(k));
     ctx_->OMSetBlendState(channel_blend_[t.depth ? 0 : mask].Get(), nullptr, 0xFFFFFFFF);
-    if (t.depth) ctx_->OMSetDepthStencilState(clear_depth_[c.flags & (kClearZ | kClearStencil)].Get(), c.stencil & 0xFF);
+    if (t.depth) {
+        uint32_t which = c.flags & (kClearZ | kClearStencil);
+        ctx_->OMSetDepthStencilState(clear_depth_[which].Get(), c.stencil & 0xFF);
+    }
     for (const RECT& r : rs) {
         if (r.right <= r.left || r.bottom <= r.top) continue;
         ctx_->RSSetScissorRects(1, &r);
@@ -1545,6 +1665,11 @@ void D3D11Backend::ClearRects(Target& t, const ClearArgs& c, const float col[4],
 void D3D11Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
     PerfScope perf_clear{g_perf.clear};
+    if (cap_.file) {
+        CapStep(s.rt);
+        fprintf(cap_.file, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_.i++, s.rt.data, s.zs.data,
+                flags, color, z);
+    }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
     std::vector<RECT> rs;
@@ -1621,6 +1746,11 @@ void D3D11Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
                         uint32_t dst_points, float src_kx, float src_ky) {
     PerfScope perf_copy{g_perf.copy};
     Target* src_t = FindTarget(src, false);
+    if (cap_.file) {
+        const char* from = "memory";
+        if (src_t) from = src_t->drawn ? "target" : "idle target";
+        fprintf(cap_.file, "%04u copy %08X %s to %08X\n", cap_.i++, src.data, from, dst.data);
+    }
     // pixels the CPU made: the copy happens in memory, textures and targets pick it up from there
     if (!src_t || !src_t->drawn) {
         if (!CopySurfaceMemory(src, dst, count, src_rects, dst_points)) {
@@ -1639,6 +1769,25 @@ void D3D11Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
         return;
     }
     CopyByRegion(*src_t, *dst_t, l);
+    if (cap_.file) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_copy_%08X", cap_.i, dst_t->data);
+        CapSave(*dst_t, name);
+    }
+}
+
+void D3D11Backend::FinishCapture(const Surface& front) {
+    CapStep(Surface{});
+    if (Target* f = FindTarget(front, false)) CapSave(*f, "final");
+    for (auto& t : cap_tex_) {
+        char name[32];
+        snprintf(name, sizeof(name), "tex_%08X", t.data);
+        CapSave(t.srv.Get(), t.w, t.h, 1, name);
+    }
+    fclose(cap_.file);
+    cap_.file = nullptr;
+    cap_tex_.clear();
+    LOGI("d3d11: frame captured to %s", cap_.dir.string().c_str());
 }
 
 void D3D11Backend::ResizeSwap() {
@@ -1742,6 +1891,11 @@ void D3D11Backend::CountFps() {
 
 void D3D11Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    if (cap_.file) {
+        FinishCapture(front);
+    } else if (g_capture.exchange(false) && CaptureOn()) {
+        StartCapture(cap_);
+    }
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
@@ -1754,6 +1908,7 @@ void D3D11Backend::Present(const Surface& front) {
     // a flip model present unbinds the back buffer
     bound_rt_ = bound_ds_ = nullptr;
 
+    DeliverReports();
     presents_++;
     presents_seen_.store(presents_);
     PollLate();
@@ -1934,6 +2089,35 @@ void D3D11Backend::RecordLate(uint32_t data) {
     if (!src.res) return;
     if (src.down) l.down = src.down;
     RecordLateCopy(l, src.res);
+}
+
+void D3D11Backend::CapSave(ID3D11ShaderResourceView* srv, uint32_t w, uint32_t h, float mul, const char* name) {
+    ComPtr<ID3D11Texture2D> down = Shrink(srv, w, h, {.mul = mul});
+    std::vector<uint8_t> px;
+    if (down && ReadBack(down.Get(), w, h, px)) WriteBmp(cap_, name, px, w, h);
+}
+
+void D3D11Backend::CapSave(Target& t, const char* name) {
+    CapSave(t.srv.Get(), t.gw, t.gh, t.depth ? 1 : t.range, name);
+}
+
+// the frame moves to another target: save the one it leaves
+void D3D11Backend::CapStep(const Surface& rt) {
+    uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
+    if (d == cap_.rt) return;
+    auto it = targets_.find(TargetMapKey(cap_.rt, false));
+    if (cap_.rt && it != targets_.end()) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X", cap_.i, cap_.rt);
+        CapSave(it->second, name);
+    }
+    auto z = targets_.find(TargetMapKey(cap_.rt, true));
+    if (cap_.rt && z != targets_.end()) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X_z", cap_.i, cap_.rt);
+        CapSave(z->second, name);
+    }
+    cap_.rt = d;
 }
 
 void D3D11Backend::SetGamma(const uint8_t* ramp) {

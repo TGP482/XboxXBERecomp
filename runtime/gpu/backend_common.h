@@ -13,7 +13,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "core/diag.h"
@@ -276,5 +279,28 @@ GuestRect ReadGuestRect(uint32_t rects, uint32_t i);
 GuestPoint ReadGuestPoint(uint32_t points, uint32_t i);
 DrawnRect ReadDrawnRect(uint32_t src_rects, uint32_t dst_points, uint32_t i);
 UINT ScaleUnsigned(int32_t v, float sc);
+
+// one F3 frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
+struct CaptureLog {
+    FILE* file = nullptr;
+    std::filesystem::path dir;
+    uint32_t i = 0;   // the next line's number
+    uint32_t rt = 0;  // surface data of the target the frame is drawing to
+    std::unordered_set<uint32_t> seen;     // textures saved
+    std::unordered_set<uint64_t> shaders;  // shaders written
+};
+// a draw as its capture line has it: ds the depth surface bound, 0 without
+struct DrawCall {
+    uint32_t prim;
+    uint32_t count;
+    uint32_t ds;
+};
+void StartCapture(CaptureLog& cap);
+// the draw's state, without its newline: the backend adds its textures, EndDrawLine ends it
+void WriteDrawLine(CaptureLog& cap, const State& s, const DrawCall& d, const PsoKey& k, const DrawConstants& c);
+void EndDrawLine(CaptureLog& cap, const State& s, const Assembled& a, uint32_t count, const DrawConstants& c);
+void CaptureShaders(CaptureLog& cap, const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
+// BGRA rows w x h as name.bmp
+void WriteBmp(const CaptureLog& cap, const char* name, const std::vector<uint8_t>& px, uint32_t w, uint32_t h);
 
 }  // namespace gpu
