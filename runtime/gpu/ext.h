@@ -16,26 +16,18 @@
 
 #include "gpu/shaders.h"
 #include "gpu/state.h"
+#include "gpu/target.h"
 #include "gpu/texture.h"
 
 namespace gpu {
 
-// a console surface the renderer draws into
-struct Target {
+// a console surface the Direct3D 12 renderer draws into
+struct Target : TargetBase {
     Microsoft::WRL::ComPtr<ID3D12Resource> res;
-    bool depth = false;
-    uint32_t gw = 0, gh = 0, w = 0, h = 0;
     uint32_t view = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-    uint32_t data = 0, bytes = 0;
-    uint64_t epoch = 0, sig = 0;  // last lock seen, guest memory as last matched
-    bool drawn = false;           // the GPU wrote it since the last readback
-    std::vector<uint8_t> read;    // what Sync left in guest memory
     Microsoft::WRL::ComPtr<ID3D12Resource> fb;  // copy read by draws that sample the target they render to
     D3D12_RESOURCE_STATES fb_state = D3D12_RESOURCE_STATE_COPY_DEST;
-    DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
-    float range = 1;         // colour held divided by it until the extension resolves the target
-    uint64_t tag = ~0ull;    // the extension's
 };
 
 // what the renderer lends an extension, on the render thread
