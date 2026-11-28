@@ -242,6 +242,7 @@ bool LatchCpuWrite(TargetBase& t);
 std::vector<uint8_t> LatchCpuChanges(TargetBase& t);
 uint64_t TargetMapKey(uint32_t data, bool depth);
 RECT ScaledRect(const TargetBase& t, int x0, int y0, int x1, int y1);
+RECT ViewportScissorRect(const State& s, uint32_t gw, float w, float h);
 
 // shaders and pipeline keys
 DrawShaders ClassifyShaders(const State& s, const Assembled& a, uint32_t count);

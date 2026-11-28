@@ -675,6 +675,23 @@ float RenderTargetShift(const State& s, const DrawShaders& sh, float target_scal
     return offset ? -0.5f * target_scale : 0.0f;
 }
 
+// viewport covers the target, the guest viewport is in the shader; the scissor clips to it in w x h host pixels
+RECT ViewportScissorRect(const State& s, uint32_t gw, float w, float h) {
+    float sc = w / gw;
+    LONG x0 = LONG(s.viewport.x * sc);
+    LONG y0 = LONG(s.viewport.y * sc);
+    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sc);
+    LONG y1 = LONG((s.viewport.y + s.viewport.h) * sc);
+    if (s.scissor_count) {
+        x0 = std::max(x0, LONG(s.scissors[0] * sc));
+        y0 = std::max(y0, LONG(s.scissors[1] * sc));
+        x1 = std::min(x1, LONG(s.scissors[2] * sc));
+        y1 = std::min(y1, LONG(s.scissors[3] * sc));
+    }
+    return {std::clamp<LONG>(x0, 0, LONG(w)), std::clamp<LONG>(y0, 0, LONG(h)), std::clamp<LONG>(x1, 0, LONG(w)),
+            std::clamp<LONG>(y1, 0, LONG(h))};
+}
+
 uint32_t CmpFunc(uint32_t v) {
     uint32_t n = v >= 0x200 && v <= 0x207 ? v - 0x200 : 7;
     return n + 1;

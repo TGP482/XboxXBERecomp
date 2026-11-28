@@ -58,6 +58,7 @@ private:
 };
 
 std::unique_ptr<Backend> CreateBackend();
+std::unique_ptr<Backend> CreateD3D11Backend();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
 
