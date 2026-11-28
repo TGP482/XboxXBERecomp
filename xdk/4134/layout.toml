@@ -1,0 +1,45 @@
+# XDK 4134 library data layouts the runtime reads or writes. Only offsets confirmed against the
+# Gun Valkyrie (Europe, title 0x49470017) default.xbe code at the address given are listed. Any key left out traps
+# when first used. The 4134 D3D code is the 4361 code with a few offsets shifted; every function named here was
+# compared against its 4361 counterpart in the Burnout default.xbe.
+[layout]
+# D3D8 CDevice, the static device D3D_pDevice (0x1ADCD0) points at (0x1AB1F0)
+CDevice_Push              = 0x0     # D3DDevice_SetStreamSource and the draws read the push pointer at [0]
+CDevice_PushThreshold     = 0x4     # push buffer kick threshold at [4]
+CDevice_Flags             = 0x8     # Direct3D_CreateDevice 0x1A2970 ors BehaviorFlags & 0x10 into [0x1AB1F8], the static device's +8
+CDevice_PixelShader       = 0x370   # D3DDevice_SetPixelShader 0x1A24F0 stores the handle at [0xDC]
+PixelShader_Definition    = 0x8     # D3DDevice_SetPixelShader 0x1A24F0 reads the definition at [handle + 8], same code as 4361
+CDevice_VertexShader      = 0x380   # D3DDevice_SetVertexShader 0x19F640 stores the current shader at [0xE0]
+CDevice_Transforms        = 0x750   # D3DDevice_SetTransform copies 16 dwords to +0x750 + type * 64
+CDevice_Viewport          = 0x9D0   # D3DDevice_SetViewport 0x19D400 stores X, Y, Width, Height, MinZ, MaxZ
+CDevice_ScreenSpaceOffset = 0x9E8   # D3DDevice_SetScreenSpaceOffset 0x19DD20 stores x and y at +0 and +4
+CDevice_ZScale            = 0x44C   # viewport helper 0x1A06C0 computes (MaxZ - MinZ) * [0x44C], 4361 has 0x450
+CDevice_SuperSampleX      = 0x454   # viewport helper 0x1A06C0 scales Width by [0x454], 4361 has 0x458
+CDevice_SuperSampleY      = 0x458   # viewport helper 0x1A06C0 scales Height by [0x458], 4361 has 0x45C
+CDevice_BaseVertex        = 0x1C    # D3DDevice_SetIndices 0x19D9F0 stores BaseVertexIndex at [0x1C]
+CDevice_IndexBuffer       = 0x38C   # D3DDevice_SetIndices 0x19D9F0 stores the index buffer at [0x38C] and its data pointer at D3D_IndexData
+CDevice_Textures          = 0xA78   # D3DDevice_SetTexture 0x19D870 stores [stage] at dword 0x29E
+CDevice_RenderTarget      = 0x2070  # the device teardown at 0x1A3670 releases it
+CDevice_Depth             = 0x2074  # the device teardown at 0x1A3670 releases it
+CDevice_BackBuffer        = 0x207C  # D3DDevice_GetBackBuffer 0x19CF80 returns it for index 0
+CDevice_FrontBuffer       = 0x2080  # D3DDevice_GetBackBuffer 0x19CF80 returns it for index -1
+CDevice_VBlankEvent       = 0x2430  # D3DDevice_BlockUntilVerticalBlank 0x19C7B0 waits on it, clears +4
+CDevice_SwapCount         = 0x2ABC  # D3DDevice_Swap 0x19EB80 increments it, 4361 has 0x2AC4
+CDevice_Size              = 0x2AE0  # D3DDevice_Release 0x19C750 clears 0xAB8 dwords of the device
+# D3D8 globals
+DirtyFlags_Texture        = 0x4800  # D3DDevice_SetTexture 0x19D870 ors it into D3D_DirtyFlags
+Stream_Size               = 12      # D3DDevice_SetStreamSource 0x19F280 indexes the stream table by n * 3 dwords
+Stream_Stride             = 0x0     # D3DDevice_SetStreamSource 0x19F280 stores Stride at D3D_Streams + n * 12
+Stream_Buffer             = 0x8     # D3DDevice_SetStreamSource 0x19F280 stores the vertex buffer at D3D_Streams + n * 12 + 8
+TextureState_Stage        = 32      # D3DDevice_SetTextureStageStateNotInline 0x1A0F70 indexes D3D_DeferredTextureState by (stage << 5) + type
+# XPP device type record, passed as 0x1AEA20 (gamepads) and 0x1AEA90 (memory units) by the game
+XPP_Current               = 0x0     # XGetDevices 0x1AF81D reads the connected-ports mask at [0]
+XPP_Changed               = 0x4     # XGetDevices 0x1AF81D clears [4], XGetDeviceChanges 0x1AF83F tests it
+XPP_Previous              = 0x8     # XGetDevices 0x1AF81D copies the mask into [8], XGetDeviceChanges 0x1AF83F reads it
+# render state numbering: the defaults function 0x1A35B0 is the 4361 one (same loops over 89 table dwords from state 0x39, the
+# same slots skipped) and its default tables at 0x1AA048 and 0x1A9BD0 are byte for byte the 4361 tables
+RenderState_Numbering     = 4361
+# DSOUND
+EffectsImage_Skip0         = 0x804  # effects image parser 0x1939E4 adds this dword count
+EffectsImage_Skip1         = 0x80C  # effects image parser 0x1939E4 loads this dword count
+EffectsImage_Desc          = 0x818  # effects image parser 0x1939E4: descriptor at image + 0x818 + (Skip0 + Skip1) * 4
