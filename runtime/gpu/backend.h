@@ -57,10 +57,15 @@ private:
     uint32_t fence_ = 0;
 };
 
-std::unique_ptr<Backend> CreateBackend();
+std::unique_ptr<Backend> CreateBackend();  // Direct3D 12
 std::unique_ptr<Backend> CreateD3D11Backend();
+// the renderer a direct3d setting gets: 11 or 12, always 12 with an extension, which is written for Direct3D 12
+uint32_t Renderer(uint32_t direct3d);
+std::unique_ptr<Backend> CreateRenderer(uint32_t direct3d);  // Renderer(direct3d)'s backend
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
+// as above; a present that finds the setting naming another renderer swaps inner for it
+std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner, uint32_t direct3d);
 
 // perf diagnostic: the title's thread recording for the render thread, and waiting on it
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};

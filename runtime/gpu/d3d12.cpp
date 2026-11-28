@@ -191,6 +191,7 @@ struct DrawBinds {
 
 class D3D12Backend final : public Backend, public Context {
 public:
+    ~D3D12Backend() override;
     bool Init(uint32_t width, uint32_t height) override;
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
@@ -425,6 +426,7 @@ private:
     ComPtr<ID3D12Resource> bb_[kFrames];
     ComPtr<ID3D12Fence> fence_;
     HANDLE event_ = nullptr;
+    bool ready_ = false;  // Init got as far as ImGui's renderer
     uint64_t fence_value_ = 0;
     Frame frames_[kFrames];
     uint64_t frame_ = 0;
@@ -541,12 +543,23 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (!CreateRootSignature()) return false;
     CreateFrames();
     CreateGammaLut();
-    ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
-                        ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
+    ready_ = ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
+                                 ui_heap_->GetCPUDescriptorHandleForHeapStart(),
+                                 ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
     Begin();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
+}
+
+// another renderer may take the window next: the GPU finishes and ImGui lets go first
+D3D12Backend::~D3D12Backend() {
+    if (ready_) {
+        Flush();
+        std::lock_guard lock(app::UiLock());
+        ImGui_ImplDX12_Shutdown();
+    }
+    if (event_) CloseHandle(event_);
 }
 
 bool D3D12Backend::CreateDevice() {

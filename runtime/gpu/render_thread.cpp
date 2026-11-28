@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "app/app.h"
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -98,7 +99,9 @@ uint64_t Ns(Clock::time_point t) { return uint64_t(std::chrono::duration_cast<st
 
 class Threaded final : public Backend {
 public:
-    explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)), ranges_(StateRanges()) {
+    // direct3d: the renderer inner is, 0 to keep it whatever the setting names
+    Threaded(std::unique_ptr<Backend> inner, uint32_t direct3d)
+        : inner_(std::move(inner)), direct3d_(direct3d), ranges_(StateRanges()) {
         ring_ = mem::AllocSystem(kHeaderRing, 64);
         cur_ = NewBatch();
         std::thread([this] { Run(); }).detach();
@@ -114,7 +117,11 @@ public:
         if (!done_cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return exited_; })) (void)inner_.release();
     }
 
-    bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
+    bool Init(uint32_t width, uint32_t height) override {
+        width_ = width;
+        height_ = height;
+        return inner_->Init(width, height);
+    }
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         auto t = Clock::now();
@@ -194,6 +201,7 @@ public:
         if (presents_) inner_->WaitGpuFrame(presents_ - 1);
         presents_++;
         last_present_ = id;
+        if (direct3d_ && Renderer(app::Get().direct3d) != direct3d_) SwapRenderer();
     }
 
     void Sync(uint32_t data, uint32_t) override { ReadBack(data, false); }
@@ -240,6 +248,29 @@ public:
     }
 
 private:
+    // on the title's thread with the render thread idle: the title's own calls to inner_ (DeliverLate, WaitGpuFrame)
+    // are on this thread too
+    void SwapRenderer() {
+        uint32_t want = Renderer(app::Get().direct3d);
+        uint32_t was = direct3d_;
+        Wait(Submit(), WaitFor::Flush, nullptr);
+        LOGR("Renderer: Direct3D %u to %u", was, want);
+        inner_.reset();
+        inner_ = CreateRenderer(want);
+        if (!inner_->Init(width_, height_)) {
+            LOGE("Renderer: Direct3D %u could not be started, back to %u", want, was);
+            inner_.reset();
+            inner_ = CreateRenderer(was);
+            if (!inner_->Init(width_, height_)) LOGE("Renderer: Direct3D %u could not be started again", was);
+            want = was;
+            app::Get().direct3d = was;
+            app::Save();
+        }
+        direct3d_ = want;
+        // the new renderer starts without the old one's targets: nothing it holds is newer than guest memory
+        written_.clear();
+    }
+
     Batch* NewBatch() {
         Batch* b;
         {
@@ -472,6 +503,8 @@ private:
     }
 
     std::unique_ptr<Backend> inner_;
+    uint32_t direct3d_;
+    uint32_t width_ = 0, height_ = 0;  // the guest size Init had, for a renderer swapped in
     std::vector<Range> ranges_;
 
     // the title's thread
@@ -512,6 +545,10 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) { return std::make_unique<Threaded>(std::move(inner)); }
+std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) { return std::make_unique<Threaded>(std::move(inner), 0); }
+
+std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner, uint32_t direct3d) {
+    return std::make_unique<Threaded>(std::move(inner), direct3d);
+}
 
 }  // namespace gpu

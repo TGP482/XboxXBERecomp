@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cwchar>
+#include <iterator>
 #include <map>
 #include <thread>
 #include <unordered_map>
@@ -294,17 +296,20 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
         g_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;  // 0x30 LIN_D16, 0x31 LIN_F16
     }
     if (!g_backend) {
-        g_backend = gpu::CreateBackend();
+        uint32_t direct3d = gpu::Renderer(app::Get().direct3d);
+        // the threaded backend keeps the size for a renderer swapped in later
+        g_backend = gpu::CreateThreadedBackend(gpu::CreateRenderer(direct3d), direct3d);
         if (!g_backend->Init(w, h)) {
             LOGE("d3d: renderer init failed");
+            wchar_t text[160];
+            swprintf(text, std::size(text),
+                     L"Direct3D %u could not be started. Make sure your graphics card supports it and its driver "
+                     L"is up to date.",
+                     direct3d);
             // no owner window: this runs on the title's thread and the window may already be fullscreen over the box
-            MessageBoxW(nullptr,
-                        L"Direct3D 12 could not be started. Make sure your graphics card supports it and its driver "
-                        L"is up to date.",
-                        app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
+            MessageBoxW(nullptr, text, app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
             kernel::Shutdown(1);
         }
-        g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
     SetDev(kDevRenderTarget, g_buffers[1]);

@@ -6,6 +6,7 @@
 
 #include "app/app.h"
 #include "core/log.h"
+#include "gpu/ext.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
@@ -803,6 +804,12 @@ void WriteBmp(const CaptureLog& cap, const char* name, const std::vector<uint8_t
     fwrite(hd, 1, kBmpHeaderBytes, f);
     fwrite(px.data(), 1, px.size(), f);
     fclose(f);
+}
+
+uint32_t Renderer(uint32_t direct3d) { return direct3d == 11 && !g_extension ? 11 : 12; }
+
+std::unique_ptr<Backend> CreateRenderer(uint32_t direct3d) {
+    return Renderer(direct3d) == 11 ? CreateD3D11Backend() : CreateBackend();
 }
 
 }  // namespace gpu
