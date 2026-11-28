@@ -106,6 +106,15 @@ inline double x87_round(X86Context& ctx, double v) {
     }
 }
 
+// fscale: ST0 * 2^trunc(ST1). The scale is clamped before the int conversion, as any scale past 2^16 has already
+// overflowed or underflowed; an infinite ST1 multiplies, so 0 * 2^+inf and inf * 2^-inf give the default NaN
+inline double x87_scale(double a, double b) {
+    if (std::isnan(b)) return a + b;
+    if (std::isinf(b)) return b > 0 ? a * b : a * 0.0;
+    double n = std::trunc(b);
+    return std::ldexp(a, n > 65536.0 ? 65536 : n < -65536.0 ? -65536 : int(n));
+}
+
 // out of range gives the integer indefinite value, as the FPU does
 inline int32_t x87_to_i32(X86Context& ctx, double v) {
     double r = x87_round(ctx, v);
